@@ -3,6 +3,11 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Utilitaires de fusion des videos
+ffmpeg/
+ffmpeg-linux/
+tmp/
+
 # C extensions
 *.so
 
@@ -149,6 +154,7 @@ activemq-data/
 
 # Environments
 .env
+.env.prod.*
 .envrc
 .venv
 env/

@@ -1,0 +1,249 @@
+type: collection.insomnia.rest/5.0
+name: Video Download Service API
+meta:
+  id: wrk_a1b2c3d4e5f67890abcd1234ef567890
+  created: 1780000000000
+  modified: 1780000000000
+collection:
+  - url: "{{ base_url }}/"
+    name: Ping
+    meta:
+      id: req_11111111111111111111111111111111
+      created: 1780000000001
+      modified: 1780000000001
+      isPrivate: false
+      sortKey: -1780000000001
+    method: GET
+    headers: []
+    settings:
+      renderRequestBody: true
+      encodeUrl: true
+      followRedirects: global
+      cookies:
+        send: true
+        store: true
+      rebuildPath: true
+    responses:
+      - status: 200
+        body: |-
+          {
+            "message": "video-service up",
+            "env": "production"
+          }
+
+  - url: "{{ base_url }}/health"
+    name: Health Check
+    meta:
+      id: req_22222222222222222222222222222222
+      created: 1780000000002
+      modified: 1780000000002
+      isPrivate: false
+      sortKey: -1780000000002
+    method: GET
+    headers: []
+    settings:
+      renderRequestBody: true
+      encodeUrl: true
+      followRedirects: global
+      cookies:
+        send: true
+        store: true
+      rebuildPath: true
+    responses:
+      - status: 200
+        body: |-
+          {
+            "status": "ok",
+            "ytdlp": "2024.12.06",
+            "activeJobs": 0
+          }
+
+  - url: "{{ base_url }}/admin/update-ytdlp"
+    name: Update yt-dlp
+    meta:
+      id: req_33333333333333333333333333333333
+      created: 1780000000003
+      modified: 1780000000003
+      isPrivate: false
+      sortKey: -1780000000003
+    method: POST
+    headers:
+      - name: X-Service-Secret
+        value: "{{ service_secret }}"
+    settings:
+      renderRequestBody: true
+      encodeUrl: true
+      followRedirects: global
+      cookies:
+        send: true
+        store: true
+      rebuildPath: true
+    responses:
+      - status: 200
+        body: |-
+          {
+            "success": true
+          }
+
+  - url: "{{ base_url }}/analyze"
+    name: Analyze URL
+    meta:
+      id: req_44444444444444444444444444444444
+      created: 1780000000004
+      modified: 1780000000004
+      isPrivate: false
+      sortKey: -1780000000004
+    method: POST
+    headers:
+      - name: Content-Type
+        value: application/json
+      - name: X-Service-Secret
+        value: "{{ service_secret }}"
+    body:
+      mimeType: application/json
+      text: |-
+        {
+          "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        }
+    settings:
+      renderRequestBody: true
+      encodeUrl: true
+      followRedirects: global
+      cookies:
+        send: true
+        store: true
+      rebuildPath: true
+    responses:
+      - status: 200
+        body: |-
+          {
+            "success": true,
+            "data": {
+              "title": "Rick Astley - Never Gonna Give You Up (Official Music Video)",
+              "duration": 212,
+              "uploader": "Rick Astley",
+              "thumbnail": "https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg",
+              "extractor": "Youtube",
+              "webpage": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+              "formats": [
+                {
+                  "id": "137",
+                  "ext": "mp4",
+                  "height": 1080,
+                  "width": 1920,
+                  "fps": 30,
+                  "filesize": null,
+                  "vcodec": "avc1.640028",
+                  "acodec": null,
+                  "tbr": 4500
+                }
+              ]
+            }
+          }
+      - status: 400
+        body: |-
+          {
+            "detail": "URL manquante"
+          }
+
+  - url: "{{ base_url }}/download/start"
+    name: Start Download
+    meta:
+      id: req_55555555555555555555555555555555
+      created: 1780000000005
+      modified: 1780000000005
+      isPrivate: false
+      sortKey: -1780000000005
+    method: POST
+    headers:
+      - name: Content-Type
+        value: application/json
+      - name: X-Service-Secret
+        value: "{{ service_secret }}"
+    body:
+      mimeType: application/json
+      text: |-
+        {
+          "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+          "format": "bestvideo+bestaudio/best",
+          "title": "Rick Astley - Never Gonna Give You Up"
+        }
+    settings:
+      renderRequestBody: true
+      encodeUrl: true
+      followRedirects: global
+      cookies:
+        send: true
+        store: true
+      rebuildPath: true
+    responses:
+      - status: 200
+        body: |-
+          {
+            "success": true,
+            "jobId": "3f9a1c2b8e4d4a2f9b6c7d8e9f0a1b2c"
+          }
+
+  - url: "{{ base_url }}/progress/{{ job_id }}"
+    name: Download Progress (SSE)
+    meta:
+      id: req_66666666666666666666666666666666
+      created: 1780000000006
+      modified: 1780000000006
+      isPrivate: false
+      sortKey: -1780000000006
+    method: GET
+    headers:
+      - name: X-Service-Secret
+        value: "{{ service_secret }}"
+    settings:
+      renderRequestBody: true
+      encodeUrl: true
+      followRedirects: global
+      cookies:
+        send: true
+        store: true
+      rebuildPath: true
+    responses: []
+
+  - url: "{{ base_url }}/file/{{ job_id }}"
+    name: Download File
+    meta:
+      id: req_77777777777777777777777777777777
+      created: 1780000000007
+      modified: 1780000000007
+      isPrivate: false
+      sortKey: -1780000000007
+    method: GET
+    headers:
+      - name: X-Service-Secret
+        value: "{{ service_secret }}"
+    settings:
+      renderRequestBody: true
+      encodeUrl: true
+      followRedirects: global
+      cookies:
+        send: true
+        store: true
+      rebuildPath: true
+    responses: []
+
+cookieJar:
+  name: Default Jar
+  meta:
+    id: jar_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1
+    created: 1780000000010
+    modified: 1780000000010
+  cookies: []
+
+environments:
+  name: Video Service Env
+  meta:
+    id: env_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1
+    created: 1780000000020
+    modified: 1780000000020
+    isPrivate: false
+  data:
+    base_url: https://streamapi.mon-ndem.com
+    service_secret: dev_DHIODJ2732UHdjoisdjffdsfsdfD9SUJDI
+    job_id: 3f9a1c2b8e4d4a2f9b6c7d8e9f0a1b2c
