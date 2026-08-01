@@ -339,6 +339,24 @@ def analyze():
     manual_subs = list((data.get("subtitles") or {}).keys())
     auto_subs = list((data.get("automatic_captions") or {}).keys())
     all_subs = sorted(set(manual_subs + auto_subs))
+    
+    selected = []
+    # 1. langue originale si elle existe
+    for lang in all_subs:
+        if lang.endswith("-orig"):
+            selected.append(lang)
+
+# 2. langues prioritaires
+    for lang in PREFERRED_SUBTITLES:
+        if lang in all_subs and lang not in selected:
+            selected.append(lang)
+
+# 3. compléter jusqu'à 10
+    for lang in all_subs:
+        if lang not in selected:
+            selected.append(lang)
+        if len(selected) >= 10:
+            break
 
     return jsonify({
         "success": True,
@@ -347,7 +365,7 @@ def analyze():
             "duration": data.get("duration"),
             "uploader": data.get("uploader") or data.get("channel") or "Inconnu",
             "thumbnail": data.get("thumbnail"),
-            "subtitles": all_subs,
+            "subtitles": selected,
             "extractor": data.get("extractor_key") or "?",
             "webpage": data.get("webpage_url") or url,
             "formats": formats,
