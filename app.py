@@ -10,8 +10,8 @@ Routes :
   GET  /                       → info service
   GET  /health                 → health-check
   POST /admin/update-ytdlp     → force la mise à jour de yt-dlp (cron externe)
-  POST /analyze                → { url } -> infos vidéo + formats disponibles
-  POST /download/start         → { url, format, title } -> { jobId }
+  POST /analyze                → { url } -> infos vidéo + formats + sous-titres disponibles
+  POST /download/start         → { url, format, title, sublang } -> { jobId }
   GET  /progress/<job_id>      → SSE de progression du téléchargement
   GET  /file/<job_id>          → stream + suppression du fichier une fois livré
 """
@@ -43,21 +43,31 @@ FFMPEG_DIR = os.path.join(BASE_DIR, "ffmpeg")
 
 os.environ["PATH"] = FFMPEG_DIR + os.pathsep + os.environ["PATH"]
 
+# ── Anti-blocage YouTube (porté depuis server.js) ────────────────
+# YouTube bloque de plus en plus le client "web" par défaut de yt-dlp.
+# On force un user-agent de vrai navigateur + on autorise le fallback
+# vers le client "android" en plus de "web" pour contourner ça.
+YTDLP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+YTDLP_ANTI_BLOCK_ARGS = [
+    "--user-agent", YTDLP_UA,
+    "--extractor-args", "youtube:player_client=android,web",
+]
+
 # ── Configuration ───────────────────────────────────────────────
 SERVICE_SECRET = os.environ.get("SERVICE_SECRET")
 CENTRAL_URL = os.environ.get("CENTRAL_URL")
 PORT = int(os.environ.get("PORT", 5100))
 ENV = os.environ.get("ENV", "development")
 
-# Dossier temporaire des fichiers en cours de téléchargement
 TMP_DIR = os.environ.get(
     "TMP_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
 )
 os.makedirs(TMP_DIR, exist_ok=True)
 
-# Durée de vie max d'un job avant nettoyage auto (secondes)
 JOB_TTL_SECONDS = 30 * 60
-# Timeout pour l'analyse (yt-dlp --dump-json peut être lent sur certains sites)
 ANALYZE_TIMEOUT = 60
 
 if not SERVICE_SECRET:
@@ -94,9 +104,6 @@ scheduler.start()
 
 app = Flask(__name__)
 
-# Ce service n'est appelé QUE par le backend Node (server-to-server).
-# origins="*" est acceptable ici car la vraie protection est le
-# X-Service-Secret, pas l'origine — mais si tu préfères, restreins à CENTRAL_URL.
 CORS(
     app,
     origins="*",
@@ -182,6 +189,14 @@ def sanitize_title(title: str) -> str:
     return cleaned[:80] or "video"
 
 
+# ── Validation d'une langue de sous-titres (porté depuis server.js) ─
+SUBLANG_RE = re.compile(r"^[a-zA-Z-]{2,8}$")
+
+
+def is_valid_sublang(sublang) -> bool:
+    return bool(sublang) and bool(SUBLANG_RE.match(sublang))
+
+
 # ─────────────────────────────────────────────────────────────────
 #  STORE DES JOBS (en mémoire, comme dans server.js)
 # ─────────────────────────────────────────────────────────────────
@@ -189,7 +204,6 @@ def sanitize_title(title: str) -> str:
 jobs = {}
 jobs_lock = threading.Lock()
 
-# job_id -> liste de queue.Queue (un abonné SSE par connexion ouverte)
 sse_queues = {}
 sse_lock = threading.Lock()
 
@@ -205,7 +219,7 @@ def sse_close(job_id):
     with sse_lock:
         subscribers = sse_queues.pop(job_id, [])
     for q in subscribers:
-        q.put(None)  # sentinelle de fin
+        q.put(None)
 
 
 def cleanup_loop():
@@ -285,7 +299,11 @@ def analyze():
 
     try:
         proc = subprocess.run(
-            ["yt-dlp", "--dump-json", "--no-warnings", "--no-playlist", url],
+            [
+                "yt-dlp", "--dump-json", "--no-warnings", "--no-playlist",
+                *YTDLP_ANTI_BLOCK_ARGS,
+                url,
+            ],
             capture_output=True,
             text=True,
             timeout=ANALYZE_TIMEOUT,
@@ -317,6 +335,11 @@ def analyze():
             "tbr": f.get("tbr"),
         })
 
+    # Extraire les langues de sous-titres (manuels + auto), porté depuis server.js
+    manual_subs = list((data.get("subtitles") or {}).keys())
+    auto_subs = list((data.get("automatic_captions") or {}).keys())
+    all_subs = sorted(set(manual_subs + auto_subs))
+
     return jsonify({
         "success": True,
         "data": {
@@ -324,6 +347,7 @@ def analyze():
             "duration": data.get("duration"),
             "uploader": data.get("uploader") or data.get("channel") or "Inconnu",
             "thumbnail": data.get("thumbnail"),
+            "subtitles": all_subs,
             "extractor": data.get("extractor_key") or "?",
             "webpage": data.get("webpage_url") or url,
             "formats": formats,
@@ -342,6 +366,7 @@ def download_start():
     url = body.get("url")
     fmt = body.get("format", "bestvideo+bestaudio/best")
     title = body.get("title", "video")
+    sublang = body.get("sublang")
 
     if not url:
         return jsonify({"error": "URL manquante"}), 400
@@ -379,6 +404,22 @@ def download_start():
     ]
     if is_audio:
         args += ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"]
+    else:
+        # Garantit un conteneur MP4 propre (porté depuis server.js)
+        args += ["--merge-output-format", "mp4"]
+        # Sous-titres embarqués si une langue valide est demandée
+        if is_valid_sublang(sublang):
+            args += [
+                "--write-subs",
+                "--write-auto-subs",
+                "--sub-langs", sublang,
+                "--embed-subs",
+            ]
+
+    # Arguments anti-blocage YouTube (porté depuis server.js) — appliqués
+    # systématiquement, pas seulement pour YouTube, car sans danger pour
+    # les autres extracteurs.
+    args += YTDLP_ANTI_BLOCK_ARGS
     args.append(url)
 
     def run_job():
@@ -473,7 +514,6 @@ def progress(job_id):
         sse_queues.setdefault(job_id, []).append(q)
 
     def gen():
-        # Snapshot de progression actuelle, envoyé immédiatement
         yield "data: " + json.dumps({
             "type": "progress",
             "percent": job_snapshot["percent"],
@@ -487,7 +527,7 @@ def progress(job_id):
                 try:
                     item = q.get(timeout=20)
                 except queue.Empty:
-                    yield ": heartbeat\n\n"  # garde la connexion ouverte
+                    yield ": heartbeat\n\n"
                     continue
                 if item is None:
                     break
@@ -503,7 +543,7 @@ def progress(job_id):
     headers = {
         "Cache-Control": "no-cache, no-transform",
         "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",  # désactive le buffering Nginx
+        "X-Accel-Buffering": "no",
     }
     return Response(stream_with_context(gen()), mimetype="text/event-stream", headers=headers)
 
@@ -578,7 +618,7 @@ if __name__ == "__main__":
             host="0.0.0.0",
             port=PORT,
             debug=(ENV == "development"),
-            threaded=True,  # indispensable : SSE + téléchargements en parallèle
+            threaded=True,
         )
     finally:
         cleanup_all_tmp_files()
