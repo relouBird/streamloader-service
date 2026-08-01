@@ -37,6 +37,20 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("video-service")
 
+PREFERRED_SUBTITLES = [
+    "fr",
+    "en",
+    "es",
+    "pt",
+    "pt-PT",
+    "de",
+    "it",
+    "ar",
+    "hi",
+    "zh-Hans",
+    "zh-Hant",
+]
+
 # ── Remplacement de FFMPEG ──────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FFMPEG_DIR = os.path.join(BASE_DIR, "ffmpeg")
