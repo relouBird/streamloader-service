@@ -58,9 +58,6 @@ FFMPEG_DIR = os.path.join(BASE_DIR, "ffmpeg")
 os.environ["PATH"] = FFMPEG_DIR + os.pathsep + os.environ["PATH"]
 
 # ── Anti-blocage YouTube (porté depuis server.js) ────────────────
-# YouTube bloque de plus en plus le client "web" par défaut de yt-dlp.
-# On force un user-agent de vrai navigateur + on autorise le fallback
-# vers le client "android" en plus de "web" pour contourner ça.
 YTDLP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -164,6 +161,8 @@ def parse_ytdlp_error(stderr: str = "") -> str:
         return "Cette vidéo requiert une connexion au compte de la plateforme."
     if "members-only" in s or "paid content" in s:
         return "Contenu réservé aux membres / payant."
+    if "429" in s or "too many requests" in s:
+        return "Trop de requêtes envoyées à la plateforme (429). Réessaie dans quelques minutes."
     if "network" in s or "connection refused" in s:
         return "Erreur réseau. Réessaie dans quelques instants."
     if "http error 403" in s:
@@ -209,7 +208,6 @@ SUBLANG_RE = re.compile(r"^[a-zA-Z-]{2,8}$")
 
 def is_valid_sublang(sublang) -> bool:
     return bool(sublang) and bool(SUBLANG_RE.match(sublang))
-
 
 # ─────────────────────────────────────────────────────────────────
 #  STORE DES JOBS (en mémoire, comme dans server.js)
@@ -259,7 +257,6 @@ def cleanup_loop():
 
 threading.Thread(target=cleanup_loop, daemon=True).start()
 
-
 # ─────────────────────────────────────────────────────────────────
 #  ROUTES DE BASE
 # ─────────────────────────────────────────────────────────────────
@@ -295,11 +292,9 @@ def trigger_update():
     update_ytdlp()
     return jsonify({"success": True})
 
-
 # ─────────────────────────────────────────────────────────────────
 #  ANALYSE
 # ─────────────────────────────────────────────────────────────────
-
 @app.post("/analyze")
 @require_secret
 def analyze():
@@ -328,6 +323,10 @@ def analyze():
         return jsonify({"error": "yt-dlp introuvable sur le serveur."}), 500
 
     if proc.returncode != 0:
+        logger.error(
+            "[analyze] yt-dlp a échoué (code=%s) pour url=%s\nSTDERR:\n%s",
+            proc.returncode, url, proc.stderr,
+        )
         return jsonify({"error": parse_ytdlp_error(proc.stderr)}), 400
 
     try:
@@ -353,19 +352,19 @@ def analyze():
     manual_subs = list((data.get("subtitles") or {}).keys())
     auto_subs = list((data.get("automatic_captions") or {}).keys())
     all_subs = sorted(set(manual_subs + auto_subs))
-    
+
     selected = []
     # 1. langue originale si elle existe
     for lang in all_subs:
         if lang.endswith("-orig"):
             selected.append(lang)
 
-# 2. langues prioritaires
+    # 2. langues prioritaires
     for lang in PREFERRED_SUBTITLES:
         if lang in all_subs and lang not in selected:
             selected.append(lang)
 
-# 3. compléter jusqu'à 10
+    # 3. compléter jusqu'à 10
     for lang in all_subs:
         if lang not in selected:
             selected.append(lang)
@@ -386,11 +385,9 @@ def analyze():
         },
     })
 
-
 # ─────────────────────────────────────────────────────────────────
 #  DÉMARRAGE D'UN TÉLÉCHARGEMENT (job en arrière-plan)
 # ─────────────────────────────────────────────────────────────────
-
 @app.post("/download/start")
 @require_secret
 def download_start():
@@ -433,6 +430,14 @@ def download_start():
         "--progress",
         "--no-warnings",
         "--no-playlist",
+        # ⚠️ CORRECTIF : sans ceci, un échec de récupération des sous-titres
+        # (ex: HTTP 429 "Too Many Requests" de YouTube, très fréquent sur
+        # l'API des sous-titres auto) fait échouer TOUT le job, alors que
+        # la vidéo elle-même aurait pu être téléchargée sans problème.
+        # --ignore-errors rend les échecs de post-traitement (dont l'embed
+        # de sous-titres) non-fatals : la vidéo est quand même livrée,
+        # simplement sans les sous-titres si leur récupération échoue.
+        "--ignore-errors",
     ]
     if is_audio:
         args += ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"]
@@ -447,6 +452,11 @@ def download_start():
                 "--sub-langs", sublang,
                 "--embed-subs",
             ]
+        elif sublang:
+            logger.warning(
+                "[download] sublang '%s' invalide (job %s) — sous-titres ignorés silencieusement",
+                sublang, job_id,
+            )
 
     # Arguments anti-blocage YouTube (porté depuis server.js) — appliqués
     # systématiquement, pas seulement pour YouTube, car sans danger pour
@@ -473,6 +483,22 @@ def download_start():
             sse_close(job_id)
             return
 
+        # ── Correctif deadlock ──────────────────────────────────────
+        # Les pipes OS ont un buffer limité (~64 Ko). Si on ne lit QUE
+        # stdout pendant que stderr se remplit (ex: logs verbeux de
+        # ffmpeg lors de l'embed des sous-titres), le process enfant se
+        # bloque en écriture sur stderr, et notre lecture de stdout ne
+        # progresse plus jamais → deadlock. On drain donc stderr dans un
+        # thread séparé, en parallèle de la lecture de stdout.
+        stderr_lines = []
+
+        def drain_stderr():
+            for line in proc.stderr:
+                stderr_lines.append(line)
+
+        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        stderr_thread.start()
+
         for line in proc.stdout:
             progress = parse_ytdlp_progress(line)
             if progress:
@@ -483,8 +509,9 @@ def download_start():
                         j["status"] = "downloading"
                 sse_emit(job_id, {"type": "progress", **progress})
 
-        stderr_output = proc.stderr.read()
         code = proc.wait()
+        stderr_thread.join(timeout=5)  # laisse le temps de finir de drainer
+        stderr_output = "".join(stderr_lines)
 
         with jobs_lock:
             j = jobs.get(job_id)
@@ -494,6 +521,14 @@ def download_start():
                 j["status"] = "done"
                 j["percent"] = 100
             else:
+                # ⚠️ On logue TOUJOURS le stderr brut ici, même si le message
+                # envoyé au client reste générique — sans ça, impossible de
+                # diagnostiquer les échecs qui ne matchent aucun pattern
+                # connu de parse_ytdlp_error().
+                logger.error(
+                    "[download] yt-dlp a échoué (code=%s, job=%s)\nCommande: %s\nSTDERR:\n%s",
+                    code, job_id, " ".join(args), stderr_output,
+                )
                 j["status"] = "error"
                 j["error"] = parse_ytdlp_error(stderr_output)
             status_snapshot = dict(j)
@@ -511,11 +546,9 @@ def download_start():
 
     return jsonify({"success": True, "jobId": job_id})
 
-
 # ─────────────────────────────────────────────────────────────────
 #  PROGRESSION (Server-Sent Events)
 # ─────────────────────────────────────────────────────────────────
-
 @app.get("/progress/<job_id>")
 @require_secret
 def progress(job_id):
@@ -579,11 +612,9 @@ def progress(job_id):
     }
     return Response(stream_with_context(gen()), mimetype="text/event-stream", headers=headers)
 
-
 # ─────────────────────────────────────────────────────────────────
 #  LIVRAISON DU FICHIER (usage unique, supprimé après envoi)
 # ─────────────────────────────────────────────────────────────────
-
 @app.get("/file/<job_id>")
 @require_secret
 def get_file(job_id):
@@ -627,11 +658,9 @@ def get_file(job_id):
     }
     return Response(generate(), headers=headers)
 
-
 # ─────────────────────────────────────────────────────────────────
 #  ARRÊT PROPRE
 # ─────────────────────────────────────────────────────────────────
-
 def cleanup_all_tmp_files():
     with jobs_lock:
         for j in jobs.values():
