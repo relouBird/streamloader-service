@@ -432,11 +432,7 @@ def download_start():
         "--no-playlist",
         # ⚠️ CORRECTIF : sans ceci, un échec de récupération des sous-titres
         # (ex: HTTP 429 "Too Many Requests" de YouTube, très fréquent sur
-        # l'API des sous-titres auto) fait échouer TOUT le job, alors que
-        # la vidéo elle-même aurait pu être téléchargée sans problème.
-        # --ignore-errors rend les échecs de post-traitement (dont l'embed
-        # de sous-titres) non-fatals : la vidéo est quand même livrée,
-        # simplement sans les sous-titres si leur récupération échoue.
+        # l'API des sous-titres auto) fait échouer TOUT le job
         "--ignore-errors",
     ]
     if is_audio:
@@ -484,12 +480,6 @@ def download_start():
             return
 
         # ── Correctif deadlock ──────────────────────────────────────
-        # Les pipes OS ont un buffer limité (~64 Ko). Si on ne lit QUE
-        # stdout pendant que stderr se remplit (ex: logs verbeux de
-        # ffmpeg lors de l'embed des sous-titres), le process enfant se
-        # bloque en écriture sur stderr, et notre lecture de stdout ne
-        # progresse plus jamais → deadlock. On drain donc stderr dans un
-        # thread séparé, en parallèle de la lecture de stdout.
         stderr_lines = []
 
         def drain_stderr():
@@ -522,9 +512,6 @@ def download_start():
                 j["percent"] = 100
             else:
                 # ⚠️ On logue TOUJOURS le stderr brut ici, même si le message
-                # envoyé au client reste générique — sans ça, impossible de
-                # diagnostiquer les échecs qui ne matchent aucun pattern
-                # connu de parse_ytdlp_error().
                 logger.error(
                     "[download] yt-dlp a échoué (code=%s, job=%s)\nCommande: %s\nSTDERR:\n%s",
                     code, job_id, " ".join(args), stderr_output,
