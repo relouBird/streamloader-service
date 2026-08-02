@@ -25,6 +25,7 @@ import queue
 import logging
 import threading
 import subprocess
+import shutil
 from urllib.parse import quote
 
 from flask import Flask, request, jsonify, Response, stream_with_context
@@ -54,10 +55,16 @@ PREFERRED_SUBTITLES = [
 # ── Remplacement de FFMPEG ──────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FFMPEG_DIR = os.path.join(BASE_DIR, "ffmpeg")
-
 os.environ["PATH"] = FFMPEG_DIR + os.pathsep + os.environ["PATH"]
 
-# ── Anti-blocage YouTube (porté depuis server.js) ────────────────
+# Vérification rapide que ffmpeg est accessible (sera aussi testée dans /health)
+FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
+if not FFMPEG_AVAILABLE:
+    logger.warning("ffmpeg introuvable dans le PATH, l'embed des sous-titres sera désactivé.")
+else:
+    logger.info("ffmpeg trouvé : %s", shutil.which("ffmpeg"))
+
+# ── Anti-blocage YouTube ────────────────────────────────────────
 YTDLP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -202,7 +209,6 @@ def sanitize_title(title: str) -> str:
     return cleaned[:80] or "video"
 
 
-# ── Validation d'une langue de sous-titres (porté depuis server.js) ─
 SUBLANG_RE = re.compile(r"^[a-zA-Z-]{2,8}$")
 
 
@@ -210,9 +216,8 @@ def is_valid_sublang(sublang) -> bool:
     return bool(sublang) and bool(SUBLANG_RE.match(sublang))
 
 # ─────────────────────────────────────────────────────────────────
-#  STORE DES JOBS (en mémoire, comme dans server.js)
+#  STORE DES JOBS
 # ─────────────────────────────────────────────────────────────────
-
 jobs = {}
 jobs_lock = threading.Lock()
 
@@ -258,9 +263,65 @@ def cleanup_loop():
 threading.Thread(target=cleanup_loop, daemon=True).start()
 
 # ─────────────────────────────────────────────────────────────────
+#  FONCTION D'EMBED DE SOUS-TITRES AVEC FFMPEG
+# ─────────────────────────────────────────────────────────────────
+def embed_subtitles_ffmpeg(video_path, subtitle_files, title, ext):
+    """
+    Intègre les fichiers de sous-titres dans la vidéo MP4.
+    Retourne True si l'opération a réussi.
+    """
+    if not subtitle_files or not FFMPEG_AVAILABLE:
+        return False
+
+    tmp_out = video_path + ".tmp.mp4"
+    cmd = ["ffmpeg", "-y", "-i", video_path]
+
+    # Ajouter chaque fichier de sous-titres en entrée
+    for sf in subtitle_files:
+        cmd += ["-i", sf]
+
+    # On copie la vidéo et l'audio tels quels
+    cmd += ["-map", "0:v", "-map", "0:a?", "-c:v", "copy", "-c:a", "copy"]
+
+    # Pour chaque fichier de sous-titres, on mappe le flux et on définit la langue
+    for idx, sf in enumerate(subtitle_files):
+        # Deviner la langue à partir du nom du fichier (ex: video.fr.srt)
+        lang = "und"
+        basename = os.path.splitext(os.path.basename(sf))[0]
+        parts = basename.split(".")
+        for part in reversed(parts):
+            if re.match(r"^[a-zA-Z]{2,3}$", part):
+                lang = part
+                break
+        # idx+1 car le premier fichier d'entrée est à l'index 1 (0 = vidéo)
+        cmd += [
+            "-map", f"{idx+1}:s",
+            f"-metadata:s:s:{idx}", f"language={lang}",
+            f"-disposition:s:{idx}", "default",
+            f"-c:s:{idx}", "mov_text",
+        ]
+    cmd += [tmp_out]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode == 0 and os.path.exists(tmp_out):
+            os.replace(tmp_out, video_path)
+            return True
+        else:
+            logger.error("ffmpeg embed error: %s", result.stderr)
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+            return False
+    except Exception as e:
+        logger.exception("Exception during ffmpeg embed: %s", e)
+        if os.path.exists(tmp_out):
+            os.remove(tmp_out)
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────
 #  ROUTES DE BASE
 # ─────────────────────────────────────────────────────────────────
-
 @app.get("/")
 def root():
     return jsonify({"message": "video-service up", "env": ENV})
@@ -276,6 +337,13 @@ def health():
     except Exception:
         ytdlp_version = "❌ non installé"
 
+    ffmpeg_ok = False
+    try:
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
+        ffmpeg_ok = r.returncode == 0
+    except Exception:
+        pass
+
     with jobs_lock:
         active_jobs = len(jobs)
 
@@ -283,6 +351,7 @@ def health():
         "status": "ok",
         "ytdlp": ytdlp_version,
         "activeJobs": active_jobs,
+        "ffmpeg_available": ffmpeg_ok,
     })
 
 
@@ -291,6 +360,7 @@ def health():
 def trigger_update():
     update_ytdlp()
     return jsonify({"success": True})
+
 
 # ─────────────────────────────────────────────────────────────────
 #  ANALYSE
@@ -386,7 +456,7 @@ def analyze():
     })
 
 # ─────────────────────────────────────────────────────────────────
-#  DÉMARRAGE D'UN TÉLÉCHARGEMENT (job en arrière-plan)
+#  DÉMARRAGE D'UN TÉLÉCHARGEMENT
 # ─────────────────────────────────────────────────────────────────
 @app.post("/download/start")
 @require_secret
@@ -422,6 +492,7 @@ def download_start():
             "error": None,
         }
 
+    # Arguments de téléchargement principal (SANS --ignore-errors)
     args = [
         "yt-dlp",
         "-f", fmt,
@@ -430,37 +501,17 @@ def download_start():
         "--progress",
         "--no-warnings",
         "--no-playlist",
-        # ⚠️ CORRECTIF : sans ceci, un échec de récupération des sous-titres
-        # (ex: HTTP 429 "Too Many Requests" de YouTube, très fréquent sur
-        # l'API des sous-titres auto) fait échouer TOUT le job
-        "--ignore-errors",
     ]
     if is_audio:
         args += ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"]
     else:
-        # Garantit un conteneur MP4 propre (porté depuis server.js)
         args += ["--merge-output-format", "mp4"]
-        # Sous-titres embarqués si une langue valide est demandée
-        if is_valid_sublang(sublang):
-            args += [
-                "--write-subs",
-                "--write-auto-subs",
-                "--sub-langs", sublang,
-                "--embed-subs",
-            ]
-        elif sublang:
-            logger.warning(
-                "[download] sublang '%s' invalide (job %s) — sous-titres ignorés silencieusement",
-                sublang, job_id,
-            )
 
-    # Arguments anti-blocage YouTube (porté depuis server.js) — appliqués
-    # systématiquement, pas seulement pour YouTube, car sans danger pour
-    # les autres extracteurs.
     args += YTDLP_ANTI_BLOCK_ARGS
     args.append(url)
 
     def run_job():
+        # --- Étape 1 : Téléchargement vidéo/audio ---
         try:
             proc = subprocess.Popen(
                 args,
@@ -479,7 +530,6 @@ def download_start():
             sse_close(job_id)
             return
 
-        # ── Correctif deadlock ──────────────────────────────────────
         stderr_lines = []
 
         def drain_stderr():
@@ -500,37 +550,89 @@ def download_start():
                 sse_emit(job_id, {"type": "progress", **progress})
 
         code = proc.wait()
-        stderr_thread.join(timeout=5)  # laisse le temps de finir de drainer
+        stderr_thread.join(timeout=5)
         stderr_output = "".join(stderr_lines)
 
+        if code != 0 or not os.path.exists(filepath):
+            # Échec du téléchargement principal
+            with jobs_lock:
+                j = jobs.get(job_id)
+                if j:
+                    j["status"] = "error"
+                    j["error"] = parse_ytdlp_error(stderr_output)
+            sse_emit(job_id, {"type": "error", "message": parse_ytdlp_error(stderr_output)})
+            sse_close(job_id)
+            return
+
+        # --- Étape 2 : Sous-titres (uniquement si vidéo et langue valide) ---
+        subs_embedded = False
+        if not is_audio and is_valid_sublang(sublang) and FFMPEG_AVAILABLE:
+            sub_output_dir = os.path.join(TMP_DIR, f"{job_id}_subs")
+            os.makedirs(sub_output_dir, exist_ok=True)
+            sub_args = [
+                "yt-dlp",
+                "--skip-download",
+                "--write-subs",
+                "--write-auto-subs",
+                "--sub-langs", sublang,
+                "-o", os.path.join(sub_output_dir, "%(title)s.%(ext)s"),
+                "--no-warnings",
+                "--no-playlist",
+                *YTDLP_ANTI_BLOCK_ARGS,
+                url
+            ]
+            try:
+                sub_proc = subprocess.run(
+                    sub_args,
+                    capture_output=True,
+                    text=True,
+                    timeout=120
+                )
+                if sub_proc.returncode != 0:
+                    logger.warning(
+                        "[download] Sous-titres non récupérés pour %s : %s",
+                        job_id, sub_proc.stderr.strip()
+                    )
+                else:
+                    # Récupérer tous les fichiers de sous-titres dans le dossier
+                    subtitle_files = []
+                    for fname in os.listdir(sub_output_dir):
+                        if any(fname.endswith(ext) for ext in ('.vtt', '.srt', '.ass')):
+                            subtitle_files.append(os.path.join(sub_output_dir, fname))
+                    if subtitle_files:
+                        subs_embedded = embed_subtitles_ffmpeg(filepath, subtitle_files, safe_title, ext)
+                        if subs_embedded:
+                            logger.info("[download] Sous-titres intégrés avec succès pour %s", job_id)
+                        else:
+                            logger.error("[download] Échec de l'intégration des sous-titres pour %s", job_id)
+                    else:
+                        logger.warning("[download] Aucun fichier de sous-titres trouvé pour %s", job_id)
+            except Exception as e:
+                logger.error("[download] Erreur pendant la récupération des sous-titres : %s", e)
+            finally:
+                try:
+                    shutil.rmtree(sub_output_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+        # --- Finalisation ---
         with jobs_lock:
             j = jobs.get(job_id)
-            if j is None:
-                return
-            if code == 0 and os.path.exists(filepath):
+            if j:
                 j["status"] = "done"
                 j["percent"] = 100
-            else:
-                # ⚠️ On logue TOUJOURS le stderr brut ici, même si le message
-                logger.error(
-                    "[download] yt-dlp a échoué (code=%s, job=%s)\nCommande: %s\nSTDERR:\n%s",
-                    code, job_id, " ".join(args), stderr_output,
-                )
-                j["status"] = "error"
-                j["error"] = parse_ytdlp_error(stderr_output)
-            status_snapshot = dict(j)
+                j["subs_embedded"] = subs_embedded
 
-        if status_snapshot["status"] == "done":
-            sse_emit(job_id, {
-                "type": "done", "jobId": job_id,
-                "title": safe_title, "ext": ext,
-            })
-        else:
-            sse_emit(job_id, {"type": "error", "message": status_snapshot["error"]})
+        sse_emit(job_id, {
+            "type": "done",
+            "jobId": job_id,
+            "title": safe_title,
+            "ext": ext,
+            "subs": subs_embedded,
+        })
         sse_close(job_id)
 
     threading.Thread(target=run_job, daemon=True).start()
-
     return jsonify({"success": True, "jobId": job_id})
 
 # ─────────────────────────────────────────────────────────────────
