@@ -14,6 +14,12 @@ Routes :
   POST /download/start         → { url, format, title, sublang } -> { jobId }
   GET  /progress/<job_id>      → SSE de progression du téléchargement
   GET  /file/<job_id>          → stream + suppression du fichier une fois livré
+
+Compatibilité lecture :
+  Après téléchargement, chaque vidéo est vérifiée (ffprobe) puis, si besoin,
+  transcodée en H.264/AAC + faststart pour être lisible sur iPhone (Safari/
+  AVFoundation n'accepte ni VP9, ni AV1, ni Opus dans un .mp4) ainsi que sur
+  Android/desktop. Voir ensure_ios_compatible().
 """
 
 import os
@@ -52,17 +58,24 @@ PREFERRED_SUBTITLES = [
     "zh-Hant",
 ]
 
-# ── Remplacement de FFMPEG ──────────────────────────────────────
+# ── Remplacement de FFMPEG (ffmpeg + ffprobe doivent être dans ce dossier) ──
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FFMPEG_DIR = os.path.join(BASE_DIR, "ffmpeg")
 os.environ["PATH"] = FFMPEG_DIR + os.pathsep + os.environ["PATH"]
 
-# Vérification rapide que ffmpeg est accessible (sera aussi testée dans /health)
 FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
+FFPROBE_AVAILABLE = shutil.which("ffprobe") is not None
 if not FFMPEG_AVAILABLE:
     logger.warning("ffmpeg introuvable dans le PATH, l'embed des sous-titres sera désactivé.")
 else:
     logger.info("ffmpeg trouvé : %s", shutil.which("ffmpeg"))
+if not FFPROBE_AVAILABLE:
+    logger.warning(
+        "ffprobe introuvable dans le PATH — la vérification de compatibilité "
+        "iPhone (codecs H.264/AAC) sera dégradée (remux systématique en aveugle)."
+    )
+else:
+    logger.info("ffprobe trouvé : %s", shutil.which("ffprobe"))
 
 # ── Anti-blocage YouTube ────────────────────────────────────────
 YTDLP_UA = (
@@ -73,6 +86,13 @@ YTDLP_ANTI_BLOCK_ARGS = [
     "--user-agent", YTDLP_UA,
     "--extractor-args", "youtube:player_client=android,web",
 ]
+
+# Préférence de codecs à la sélection du format : yt-dlp choisira en priorité
+# du H.264/AAC quand plusieurs formats équivalents existent pour une même
+# résolution — ça évite un transcodage inutile dans la majorité des cas.
+# (Sans ça, yt-dlp choisit très souvent VP9+Opus sur YouTube en 1080p+, qui
+# ne se lit pas du tout sur iPhone même une fois remballé en .mp4.)
+FORMAT_SORT_ARGS = ["-S", "res,vcodec:h264,acodec:aac"]
 
 # ── Configuration ───────────────────────────────────────────────
 SERVICE_SECRET = os.environ.get("SERVICE_SECRET")
@@ -263,6 +283,139 @@ def cleanup_loop():
 threading.Thread(target=cleanup_loop, daemon=True).start()
 
 # ─────────────────────────────────────────────────────────────────
+#  COMPATIBILITÉ iPHONE — vérification + correction des codecs
+# ─────────────────────────────────────────────────────────────────
+
+def probe_video_streams(filepath):
+    """
+    Inspecte les flux du fichier via ffprobe et retourne
+    {"vcodec": ..., "acodec": ..., "pix_fmt": ...} ou None si indisponible.
+    """
+    if not FFPROBE_AVAILABLE:
+        return None
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "stream=codec_type,codec_name,pix_fmt",
+            "-of", "json",
+            filepath,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            logger.warning("[ios-compat] ffprobe a échoué : %s", result.stderr.strip()[-300:])
+            return None
+        data = json.loads(result.stdout)
+        info = {"vcodec": None, "acodec": None, "pix_fmt": None}
+        for s in data.get("streams", []):
+            if s.get("codec_type") == "video" and info["vcodec"] is None:
+                info["vcodec"] = s.get("codec_name")
+                info["pix_fmt"] = s.get("pix_fmt")
+            elif s.get("codec_type") == "audio" and info["acodec"] is None:
+                info["acodec"] = s.get("codec_name")
+        return info
+    except Exception:
+        logger.exception("[ios-compat] Exception pendant ffprobe")
+        return None
+
+
+def _remux_faststart(filepath: str) -> bool:
+    """
+    Recopie les flux tels quels (rapide, sans perte de qualité) en replaçant
+    le moov atom au début du fichier — indispensable pour qu'AVFoundation
+    (lecteur vidéo iOS) et la lecture progressive/AirPlay fonctionnent.
+    """
+    tmp_out = filepath + ".fs.mp4"
+    cmd = ["ffmpeg", "-y", "-i", filepath, "-c", "copy", "-movflags", "+faststart", tmp_out]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if result.returncode == 0 and os.path.exists(tmp_out):
+            os.replace(tmp_out, filepath)
+            return True
+        logger.warning("[ios-compat] remux faststart échoué : %s", result.stderr.strip()[-500:])
+    except Exception:
+        logger.exception("[ios-compat] Exception pendant le remux faststart")
+    if os.path.exists(tmp_out):
+        try:
+            os.remove(tmp_out)
+        except OSError:
+            pass
+    return False
+
+
+def _transcode_to_h264_aac(filepath: str) -> bool:
+    """
+    Ré-encode en H.264 8-bit (yuv420p) + AAC. Nécessaire pour les vidéos
+    livrées par yt-dlp en VP9/AV1 (vidéo) ou Opus (audio) — très fréquent sur
+    YouTube dès la 1080p — car iOS Safari/AVFoundation ne décode aucun des
+    trois dans un conteneur .mp4 (contrairement à Chrome/Android qui gèrent
+    tout ça nativement, d'où le "ça marche partout sauf sur iPhone").
+    """
+    tmp_out = filepath + ".h264.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-i", filepath,
+        "-c:v", "libx264", "-profile:v", "high", "-level", "4.1",
+        "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "20",
+        "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+        "-movflags", "+faststart",
+        tmp_out,
+    ]
+    try:
+        # Un ré-encodage peut prendre plusieurs minutes sur une vidéo longue :
+        # on borne large plutôt que de faire échouer le job pour rien.
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        if result.returncode == 0 and os.path.exists(tmp_out):
+            os.replace(tmp_out, filepath)
+            return True
+        logger.error("[ios-compat] transcodage H.264/AAC échoué : %s", result.stderr.strip()[-500:])
+    except subprocess.TimeoutExpired:
+        logger.error("[ios-compat] transcodage H.264/AAC : timeout dépassé (vidéo trop longue ?)")
+    except Exception:
+        logger.exception("[ios-compat] Exception pendant le transcodage")
+    if os.path.exists(tmp_out):
+        try:
+            os.remove(tmp_out)
+        except OSError:
+            pass
+    return False
+
+
+def ensure_ios_compatible(filepath: str) -> dict:
+    """
+    Garantit qu'un MP4 vidéo est lisible sur iPhone (et par ricochet partout
+    ailleurs) :
+      - vidéo H.264 8-bit 4:2:0 (yuv420p)
+      - audio AAC
+      - moov atom en tête de fichier (faststart)
+
+    Retourne {"action": "none"|"remux"|"transcode", "ok": bool}.
+    """
+    if not FFMPEG_AVAILABLE:
+        return {"action": "none", "ok": False}
+
+    info = probe_video_streams(filepath)
+
+    if info is None:
+        # Impossible de vérifier les codecs (ffprobe absent/échoué) : on fait
+        # au moins un remux+faststart par sécurité, qui ne casse rien même
+        # si les codecs étaient déjà bons.
+        ok = _remux_faststart(filepath)
+        return {"action": "remux", "ok": ok}
+
+    needs_transcode = (
+        info["vcodec"] not in ("h264",)
+        or info["acodec"] not in ("aac",)
+        or (info["pix_fmt"] is not None and info["pix_fmt"] not in ("yuv420p",))
+    )
+
+    if needs_transcode:
+        ok = _transcode_to_h264_aac(filepath)
+        return {"action": "transcode", "ok": ok}
+
+    ok = _remux_faststart(filepath)
+    return {"action": "remux", "ok": ok}
+
+
+# ─────────────────────────────────────────────────────────────────
 #  FONCTION D'EMBED DE SOUS-TITRES AVEC FFMPEG
 # ─────────────────────────────────────────────────────────────────
 def embed_subtitles_ffmpeg(video_path, subtitle_files, title, ext):
@@ -280,12 +433,12 @@ def embed_subtitles_ffmpeg(video_path, subtitle_files, title, ext):
     for sf in subtitle_files:
         cmd += ["-i", sf]
 
-    # On copie la vidéo et l'audio tels quels
+    # On copie la vidéo et l'audio tels quels (déjà H.264/AAC à ce stade,
+    # cf. ensure_ios_compatible() appelé avant cette étape)
     cmd += ["-map", "0:v", "-map", "0:a?", "-c:v", "copy", "-c:a", "copy"]
 
     # Pour chaque fichier de sous-titres, on mappe le flux et on définit la langue
     for idx, sf in enumerate(subtitle_files):
-        # Deviner la langue à partir du nom du fichier (ex: video.fr.srt)
         lang = "und"
         basename = os.path.splitext(os.path.basename(sf))[0]
         parts = basename.split(".")
@@ -293,14 +446,16 @@ def embed_subtitles_ffmpeg(video_path, subtitle_files, title, ext):
             if re.match(r"^[a-zA-Z]{2,3}$", part):
                 lang = part
                 break
-        # idx+1 car le premier fichier d'entrée est à l'index 1 (0 = vidéo)
         cmd += [
             "-map", f"{idx+1}:s",
             f"-metadata:s:s:{idx}", f"language={lang}",
             f"-disposition:s:{idx}", "default",
             f"-c:s:{idx}", "mov_text",
         ]
-    cmd += [tmp_out]
+
+    # faststart à nouveau ici : ré-écrire le fichier avec des flux de
+    # sous-titres en plus déplace le moov atom, il faut le refixer.
+    cmd += ["-movflags", "+faststart", tmp_out]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -352,6 +507,7 @@ def health():
         "ytdlp": ytdlp_version,
         "activeJobs": active_jobs,
         "ffmpeg_available": ffmpeg_ok,
+        "ffprobe_available": FFPROBE_AVAILABLE,
     })
 
 
@@ -424,17 +580,12 @@ def analyze():
     all_subs = sorted(set(manual_subs + auto_subs))
 
     selected = []
-    # 1. langue originale si elle existe
     for lang in all_subs:
         if lang.endswith("-orig"):
             selected.append(lang)
-
-    # 2. langues prioritaires
     for lang in PREFERRED_SUBTITLES:
         if lang in all_subs and lang not in selected:
             selected.append(lang)
-
-    # 3. compléter jusqu'à 10
     for lang in all_subs:
         if lang not in selected:
             selected.append(lang)
@@ -506,6 +657,9 @@ def download_start():
         args += ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"]
     else:
         args += ["--merge-output-format", "mp4"]
+        # Préférence H.264/AAC à sélection égale (résolution identique) —
+        # réduit les cas où un transcodage complet devient nécessaire.
+        args += FORMAT_SORT_ARGS
 
     args += YTDLP_ANTI_BLOCK_ARGS
     args.append(url)
@@ -554,7 +708,6 @@ def download_start():
         stderr_output = "".join(stderr_lines)
 
         if code != 0 or not os.path.exists(filepath):
-            # Échec du téléchargement principal
             with jobs_lock:
                 j = jobs.get(job_id)
                 if j:
@@ -564,7 +717,34 @@ def download_start():
             sse_close(job_id)
             return
 
-        # --- Étape 2 : Sous-titres (uniquement si vidéo et langue valide) ---
+        # --- Étape 2 : Compatibilité iPhone (H.264/AAC + faststart) ---
+        # Uniquement pour la vidéo — un .mp3 n'a pas ce problème.
+        compat_result = {"action": "none", "ok": False}
+        if not is_audio:
+            with jobs_lock:
+                j = jobs.get(job_id)
+                if j:
+                    j["status"] = "processing"
+            sse_emit(job_id, {
+                "type": "processing",
+                "message": "Optimisation pour compatibilité iPhone/Android…",
+            })
+            try:
+                compat_result = ensure_ios_compatible(filepath)
+                if compat_result["action"] == "transcode":
+                    logger.info(
+                        "[download] %s : vidéo transcodée en H.264/AAC pour compatibilité iPhone (ok=%s)",
+                        job_id, compat_result["ok"],
+                    )
+                elif compat_result["action"] == "remux":
+                    logger.info(
+                        "[download] %s : remux faststart appliqué (ok=%s)",
+                        job_id, compat_result["ok"],
+                    )
+            except Exception:
+                logger.exception("[download] Erreur pendant l'optimisation iOS pour %s", job_id)
+
+        # --- Étape 3 : Sous-titres (uniquement si vidéo et langue valide) ---
         subs_embedded = False
         if not is_audio and is_valid_sublang(sublang) and FFMPEG_AVAILABLE:
             sub_output_dir = os.path.join(TMP_DIR, f"{job_id}_subs")
@@ -594,7 +774,6 @@ def download_start():
                         job_id, sub_proc.stderr.strip()
                     )
                 else:
-                    # Récupérer tous les fichiers de sous-titres dans le dossier
                     subtitle_files = []
                     for fname in os.listdir(sub_output_dir):
                         if any(fname.endswith(ext) for ext in ('.vtt', '.srt', '.ass')):
@@ -622,6 +801,7 @@ def download_start():
                 j["status"] = "done"
                 j["percent"] = 100
                 j["subs_embedded"] = subs_embedded
+                j["ios_compat_action"] = compat_result["action"]
 
         sse_emit(job_id, {
             "type": "done",
@@ -668,13 +848,22 @@ def progress(job_id):
         sse_queues.setdefault(job_id, []).append(q)
 
     def gen():
-        yield "data: " + json.dumps({
-            "type": "progress",
-            "percent": job_snapshot["percent"],
-            "speed": job_snapshot["speed"],
-            "eta": job_snapshot["eta"],
-            "total": job_snapshot["total"],
-        }) + "\n\n"
+        # Snapshot immédiat : "processing" n'a pas de pourcentage propre, on
+        # renvoie simplement le dernier état de progression connu (souvent 100%
+        # côté téléchargement, l'optimisation ne remonte pas de %).
+        if job_snapshot["status"] == "processing":
+            yield "data: " + json.dumps({
+                "type": "processing",
+                "message": "Optimisation pour compatibilité iPhone/Android…",
+            }) + "\n\n"
+        else:
+            yield "data: " + json.dumps({
+                "type": "progress",
+                "percent": job_snapshot["percent"],
+                "speed": job_snapshot["speed"],
+                "eta": job_snapshot["eta"],
+                "total": job_snapshot["total"],
+            }) + "\n\n"
 
         try:
             while True:

@@ -155,7 +155,8 @@ immédiatement, le suivi se fait ensuite via `/progress/:jobId`.
 {
   "url": "https://www.youtube.com/watch?v=...",
   "format": "bestvideo+bestaudio/best",
-  "title": "Nom du fichier souhaité"
+  "title": "Nom du fichier souhaité",
+  "subLang": "fr"
 }
 ```
 
