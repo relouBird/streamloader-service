@@ -285,53 +285,81 @@ threading.Thread(target=cleanup_loop, daemon=True).start()
 # ─────────────────────────────────────────────────────────────────
 #  COMPATIBILITÉ iPHONE — vérification + correction des codecs
 # ─────────────────────────────────────────────────────────────────
-
-def probe_video_streams(filepath):
+def probe_video_streams(filepath: str) -> dict | None:
     """
-    Inspecte les flux du fichier via ffprobe et retourne
-    {"vcodec": ..., "acodec": ..., "pix_fmt": ...} ou None si indisponible.
+    Inspecte les flux vidéo/audio d'un fichier via ffprobe.
+    Retourne un dict avec les infos nécessaires pour décider si un
+    transcodage est requis pour la compatibilité iPhone, ou None si
+    ffprobe est indisponible / a échoué.
     """
     if not FFPROBE_AVAILABLE:
         return None
+
     try:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "stream=codec_type,codec_name,pix_fmt",
-            "-of", "json",
-            filepath,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            logger.warning("[ios-compat] ffprobe a échoué : %s", result.stderr.strip()[-300:])
-            return None
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries",
+                "stream=codec_type,codec_name,pix_fmt,profile,level,channels,sample_rate",
+                "-of", "json",
+                filepath,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
         data = json.loads(result.stdout)
-        info = {"vcodec": None, "acodec": None, "pix_fmt": None}
-        for s in data.get("streams", []):
-            if s.get("codec_type") == "video" and info["vcodec"] is None:
-                info["vcodec"] = s.get("codec_name")
-                info["pix_fmt"] = s.get("pix_fmt")
-            elif s.get("codec_type") == "audio" and info["acodec"] is None:
-                info["acodec"] = s.get("codec_name")
-        return info
     except Exception:
-        logger.exception("[ios-compat] Exception pendant ffprobe")
+        logger.exception("[ios-compat] ffprobe a échoué sur %s", filepath)
         return None
+
+    vcodec = pix_fmt = profile = level = None
+    acodec = channels = sample_rate = None
+
+    for s in data.get("streams", []):
+        if s.get("codec_type") == "video" and vcodec is None:
+            vcodec = s.get("codec_name")
+            pix_fmt = s.get("pix_fmt")
+            profile = (s.get("profile") or "").strip().lower()
+            level = s.get("level")  # entier ffprobe : 41 = level 4.1, 40 = level 4.0, etc.
+        elif s.get("codec_type") == "audio" and acodec is None:
+            acodec = s.get("codec_name")
+            channels = s.get("channels")
+            sample_rate = s.get("sample_rate")
+
+    return {
+        "vcodec": vcodec,
+        "pix_fmt": pix_fmt,
+        "profile": profile,
+        "level": level,
+        "acodec": acodec,
+        "channels": channels,
+        "sample_rate": sample_rate,
+    }
 
 
 def _remux_faststart(filepath: str) -> bool:
     """
-    Recopie les flux tels quels (rapide, sans perte de qualité) en replaçant
-    le moov atom au début du fichier — indispensable pour qu'AVFoundation
-    (lecteur vidéo iOS) et la lecture progressive/AirPlay fonctionnent.
+    Réécrit le conteneur MP4 avec le moov atom en tête (faststart), sans
+    ré-encoder les flux. Nécessaire pour le streaming progressif sur iOS
+    (sinon Safari/AVFoundation doit télécharger tout le fichier avant de
+    pouvoir commencer la lecture, ce qui peut ressembler à un "bug" côté
+    utilisateur — vidéo qui ne démarre jamais).
     """
-    tmp_out = filepath + ".fs.mp4"
-    cmd = ["ffmpeg", "-y", "-i", filepath, "-c", "copy", "-movflags", "+faststart", tmp_out]
+    tmp_out = filepath + ".faststart.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-i", filepath,
+        "-c", "copy", "-movflags", "+faststart",
+        tmp_out,
+    ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode == 0 and os.path.exists(tmp_out):
             os.replace(tmp_out, filepath)
             return True
-        logger.warning("[ios-compat] remux faststart échoué : %s", result.stderr.strip()[-500:])
+        logger.error("[ios-compat] remux faststart échoué : %s", result.stderr.strip()[-500:])
+    except subprocess.TimeoutExpired:
+        logger.error("[ios-compat] remux faststart : timeout dépassé")
     except Exception:
         logger.exception("[ios-compat] Exception pendant le remux faststart")
     if os.path.exists(tmp_out):
@@ -344,11 +372,15 @@ def _remux_faststart(filepath: str) -> bool:
 
 def _transcode_to_h264_aac(filepath: str) -> bool:
     """
-    Ré-encode en H.264 8-bit (yuv420p) + AAC. Nécessaire pour les vidéos
-    livrées par yt-dlp en VP9/AV1 (vidéo) ou Opus (audio) — très fréquent sur
-    YouTube dès la 1080p — car iOS Safari/AVFoundation ne décode aucun des
-    trois dans un conteneur .mp4 (contrairement à Chrome/Android qui gèrent
-    tout ça nativement, d'où le "ça marche partout sauf sur iPhone").
+    Ré-encode en H.264 8-bit (yuv420p, profile High, level 4.1) + AAC stéréo.
+    Nécessaire pour les vidéos livrées par yt-dlp en VP9/AV1 (vidéo) ou Opus
+    (audio) — très fréquent sur YouTube dès la 1080p — car iOS Safari/
+    AVFoundation ne décode aucun des trois. Nécessaire aussi pour les cas
+    plus sournois où le conteneur annonce "h264/aac" mais avec un profile,
+    un level ou un nombre de canaux audio non supportés par iOS (High 10-bit,
+    4:4:4, level > 4.2, audio 5.1/7.1...) — ce sont ces cas-là qui donnent
+    l'impression que "ça marche partout sauf sur iPhone" alors que le codec
+    de base est le bon.
     """
     tmp_out = filepath + ".h264.mp4"
     cmd = [
@@ -383,8 +415,9 @@ def ensure_ios_compatible(filepath: str) -> dict:
     """
     Garantit qu'un MP4 vidéo est lisible sur iPhone (et par ricochet partout
     ailleurs) :
-      - vidéo H.264 8-bit 4:2:0 (yuv420p)
-      - audio AAC
+      - vidéo H.264 8-bit 4:2:0 (yuv420p), profile Baseline/Main/High,
+        level ≤ 4.2 (compatible avec tous les iPhones, y compris anciens)
+      - audio AAC stéréo (≤ 2 canaux)
       - moov atom en tête de fichier (faststart)
 
     Retourne {"action": "none"|"remux"|"transcode", "ok": bool}.
@@ -401,19 +434,41 @@ def ensure_ios_compatible(filepath: str) -> dict:
         ok = _remux_faststart(filepath)
         return {"action": "remux", "ok": ok}
 
+    # Profils H.264 supportés nativement par AVFoundation sur iPhone.
+    ALLOWED_PROFILES = ("baseline", "constrained baseline", "main", "high")
+
+    profile_ok = info["profile"] in ALLOWED_PROFILES
+
+    # ffprobe renvoie le level comme un entier type 41 pour "4.1", 40 pour
+    # "4.0" etc. On vise ≤ 42 (level 4.2) pour rester safe même sur des
+    # iPhones plus anciens qui plafonnent parfois en dessous de 5.0/5.1.
+    level_ok = info["level"] is None or info["level"] <= 42
+
+    # Au-delà de la stéréo, certains iPhones/versions iOS ont des soucis
+    # avec l'AAC multicanal (5.1/7.1) livré tel quel dans un .mp4.
+    channels_ok = info["channels"] is None or info["channels"] <= 2
+
     needs_transcode = (
-        info["vcodec"] not in ("h264",)
-        or info["acodec"] not in ("aac",)
-        or (info["pix_fmt"] is not None and info["pix_fmt"] not in ("yuv420p",))
+        info["vcodec"] != "h264"
+        or info["acodec"] != "aac"
+        or (info["pix_fmt"] is not None and info["pix_fmt"] != "yuv420p")
+        or not profile_ok
+        or not level_ok
+        or not channels_ok
     )
 
     if needs_transcode:
+        logger.info(
+            "[ios-compat] Transcodage requis pour %s (vcodec=%s, acodec=%s, "
+            "pix_fmt=%s, profile=%s, level=%s, channels=%s)",
+            filepath, info["vcodec"], info["acodec"], info["pix_fmt"],
+            info["profile"], info["level"], info["channels"],
+        )
         ok = _transcode_to_h264_aac(filepath)
         return {"action": "transcode", "ok": ok}
 
     ok = _remux_faststart(filepath)
     return {"action": "remux", "ok": ok}
-
 
 # ─────────────────────────────────────────────────────────────────
 #  FONCTION D'EMBED DE SOUS-TITRES AVEC FFMPEG
