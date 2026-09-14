@@ -32,6 +32,7 @@ import logging
 import threading
 import subprocess
 from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 from flask import Flask, request, jsonify, Response, stream_with_context
 from dotenv import load_dotenv
@@ -380,6 +381,63 @@ def transcode_audio(filepath: str):
         except OSError:
             pass
         raise RuntimeError((proc.stderr or "")[-500:])
+    os.remove(filepath)
+    os.rename(converted_path, filepath)
+
+
+# ── Pochette + métadonnées ID3 — pour l'endpoint /download/music ────────
+MAX_COVER_BYTES = 5 * 1024 * 1024  # 5 Mo, largement suffisant pour une cover
+
+
+def download_cover_image(url: str, dest_path: str):
+    """Télécharge une image de couverture, avec la même protection SSRF que
+    pour les vidéos (même si l'URL provient typiquement d'une API tierce de
+    confiance comme Shazam, c'est une URL externe fournie dans un body de
+    requête — défense en profondeur)."""
+    assert_public_http_url(url)
+    req = Request(url, headers={"User-Agent": YTDLP_UA})
+    with urlopen(req, timeout=10) as resp:
+        data = resp.read(MAX_COVER_BYTES + 1)
+        if len(data) > MAX_COVER_BYTES:
+            raise ValueError("Image de couverture trop volumineuse")
+        with open(dest_path, "wb") as f:
+            f.write(data)
+
+
+def finalize_audio_with_metadata(filepath: str, title: str = None, artist: str = None, cover_path: str = None):
+    """
+    Ré-encode l'audio en MP3 en embarquant les métadonnées ID3 (titre/artiste)
+    et, si fournie, une pochette en tant que piste vidéo attachée (norme ID3
+    standard pour l'art de couverture). Porté depuis bot.js (transcodeAudio).
+    """
+    converted_path = f"{filepath}.converted.mp3"
+    args = ["ffmpeg", "-y", "-i", filepath]
+
+    if cover_path:
+        args += ["-i", cover_path, "-map", "0:a", "-map", "1:0"]
+    else:
+        # Préserve une éventuelle miniature déjà embarquée par yt-dlp.
+        args += ["-map", "0:a", "-map", "0:v?"]
+
+    args += ["-c:a", "libmp3lame", "-q:a", "2", "-c:v", "copy", "-map_metadata", "0", "-id3v2_version", "3"]
+
+    if cover_path:
+        args += ["-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)"]
+    if title:
+        args += ["-metadata", f"title={title}"]
+    if artist:
+        args += ["-metadata", f"artist={artist}"]
+
+    args.append(converted_path)
+
+    proc = subprocess.run(args, capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0 or not os.path.exists(converted_path):
+        try:
+            os.remove(converted_path)
+        except OSError:
+            pass
+        raise RuntimeError((proc.stderr or "")[-500:])
+
     os.remove(filepath)
     os.rename(converted_path, filepath)
 
@@ -935,8 +993,163 @@ def download_start():
 
 
 # ─────────────────────────────────────────────────────────────────
-#  PROGRESSION (Server-Sent Events)
+#  RECHERCHE MUSICALE DÉDIÉE (job en arrière-plan)
 # ─────────────────────────────────────────────────────────────────
+# Endpoint séparé de /download/start, volontairement : ici on sait déjà
+# qu'on veut un MP3 avec métadonnées/pochette embarquées à partir d'une
+# recherche texte (ytsearch1:...), jamais une URL arbitraire fournie par
+# l'utilisateur final — pas de logique conditionnelle mêlée à la route
+# générique.
+
+QUERY_MAX_LENGTH = 200
+
+
+@app.post("/download/music")
+@require_secret
+def download_music():
+    body = request.get_json(silent=True) or {}
+    query = (body.get("query") or "").strip()
+    title = (body.get("title") or "audio").strip()
+    artist = body.get("artist")
+    cover_url = body.get("coverUrl")
+
+    if not query:
+        return jsonify({"error": "query manquant"}), 400
+    if len(query) > QUERY_MAX_LENGTH:
+        return jsonify({"error": "query trop long"}), 400
+
+    with jobs_lock:
+        current_jobs = len(jobs)
+    if current_jobs >= MAX_CONCURRENT_JOBS:
+        return jsonify({
+            "error": "Le serveur est actuellement très sollicité. Réessaie dans quelques instants.",
+            "code": "SERVER_BUSY",
+        }), 503
+
+    # ytsearch1:... n'est jamais une adresse réseau arbitraire fournie par
+    # l'utilisateur — yt-dlp résout toujours cette syntaxe contre l'endpoint
+    # de recherche YouTube lui-même, jamais contre une destination choisie
+    # par l'appelant. Pas de vérification SSRF nécessaire ici (contrairement
+    # à /analyze et /download/start qui reçoivent une vraie URL).
+    search_url = f"ytsearch1:{query}"
+
+    job_id = uuid.uuid4().hex
+    safe_title = sanitize_title(title)
+    filepath = os.path.join(TMP_DIR, f"{job_id}.mp3")
+
+    with jobs_lock:
+        jobs[job_id] = {
+            "status": "starting", "percent": 0, "speed": None, "eta": None, "total": None,
+            "filepath": filepath, "title": safe_title, "ext": "mp3",
+            "created_at": time.time(), "error": None,
+        }
+
+    args = [
+        "yt-dlp",
+        "-f", "bestaudio/best",
+        "-o", filepath,
+        "--newline", "--progress",
+        "--no-warnings", "--no-playlist", "--no-mtime",
+        "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
+        "--user-agent", YTDLP_UA,
+        search_url,
+    ]
+
+    def run_job():
+        try:
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        except FileNotFoundError:
+            with jobs_lock:
+                j = jobs.get(job_id)
+                if j:
+                    j["status"] = "error"
+                    j["error"] = "yt-dlp introuvable sur le serveur."
+            sse_emit(job_id, {"type": "error", "message": "yt-dlp introuvable sur le serveur."})
+            sse_close(job_id)
+            return
+
+        stderr_lines = []
+
+        def drain_stderr():
+            for line in proc.stderr:
+                stderr_lines.append(line)
+
+        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        stderr_thread.start()
+
+        for line in proc.stdout:
+            progress = parse_ytdlp_progress(line)
+            if progress:
+                with jobs_lock:
+                    j = jobs.get(job_id)
+                    if j:
+                        j.update(progress)
+                        j["status"] = "downloading"
+                sse_emit(job_id, {"type": "progress", **progress})
+
+        code = proc.wait()
+        stderr_thread.join(timeout=5)
+        stderr_output = "".join(stderr_lines)
+
+        if code != 0 or not os.path.exists(filepath):
+            logger.error("[music] yt-dlp a échoué (code=%s, job=%s) query=%r\nSTDERR:\n%s", code, job_id, query, stderr_output)
+            with jobs_lock:
+                j = jobs.get(job_id)
+                if j:
+                    j["status"] = "error"
+                    j["error"] = parse_ytdlp_error(stderr_output)
+            sse_emit(job_id, {"type": "error", "message": parse_ytdlp_error(stderr_output)})
+            sse_close(job_id)
+            return
+
+        with jobs_lock:
+            j = jobs.get(job_id)
+            if j:
+                j["status"] = "converting"
+                j["percent"] = 99
+        sse_emit(job_id, {"type": "processing", "percent": 99, "message": "Ajout des métadonnées et de la pochette…"})
+
+        cover_path = None
+        try:
+            if cover_url:
+                cover_path = os.path.join(TMP_DIR, f"{job_id}_cover.jpg")
+                try:
+                    download_cover_image(cover_url, cover_path)
+                except Exception as e:
+                    logger.warning("[music] pochette non récupérée job=%s : %s", job_id, e)
+                    cover_path = None
+
+            finalize_audio_with_metadata(filepath, title=title, artist=artist, cover_path=cover_path)
+        except Exception as e:
+            logger.error("[music] finalisation échouée job=%s : %s", job_id, e)
+            with jobs_lock:
+                j = jobs.get(job_id)
+                if j:
+                    j["status"] = "error"
+                    j["error"] = f"Finalisation audio impossible : {e}"
+            sse_emit(job_id, {"type": "error", "message": f"Finalisation audio impossible : {e}"})
+            sse_close(job_id)
+            return
+        finally:
+            if cover_path and os.path.exists(cover_path):
+                try:
+                    os.remove(cover_path)
+                except OSError:
+                    pass
+
+        with jobs_lock:
+            j = jobs.get(job_id)
+            if j is None:
+                return
+            j["status"] = "done"
+            j["percent"] = 100
+
+        sse_emit(job_id, {"type": "done", "jobId": job_id, "title": safe_title, "ext": "mp3"})
+        sse_close(job_id)
+
+    threading.Thread(target=run_job, daemon=True).start()
+
+    return jsonify({"success": True, "jobId": job_id})
 
 @app.get("/progress/<job_id>")
 @require_secret
