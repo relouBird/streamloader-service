@@ -948,7 +948,7 @@ def download_start():
                 j["status"] = "converting"
                 j["percent"] = 99
         sse_emit(job_id, {
-            "type": "processing", "percent": 99,
+            "type": "processing", "percent": 99.9,
             "message": "Récupération des sous-titres et finalisation…" if normalized_sublang else "Finalisation et optimisation de la qualité…",
         })
 
