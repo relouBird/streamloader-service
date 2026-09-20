@@ -12,6 +12,9 @@ Routes :
   GET  /                       → info service
   GET  /health                 → health-check
   POST /admin/update-ytdlp     → force la mise à jour de yt-dlp (cron externe)
+  GET  /admin/cookies/status   → présence/âge du cookie jar YouTube
+  POST /admin/cookies          → upload/remplace le cookie jar YouTube
+  DELETE /admin/cookies        → supprime le cookie jar YouTube
   POST /analyze                → { url } -> infos vidéo + formats + sous-titres
   POST /download/start         → { url, quality|format, title, sublang,
                                     trim, startTime, endTime } -> { jobId }
@@ -63,6 +66,35 @@ YTDLP_UA = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
+# ── Cookies YouTube (contournement du blocage anti-bot sur IP de
+#    datacenter/VPS : "Sign in to confirm you're not a bot") ───────────
+# Chemin FIXE sur disque, peu importe le nom du fichier original que tu
+# uploades via POST /admin/cookies — c'est justement le but : plus besoin de
+# se souvenir d'un nom de fichier ni de se reconnecter en SSH à chaque
+# renouvellement.
+COOKIES_PATH = os.path.join(BASE_DIR, "cookies.txt")
+MAX_COOKIES_BYTES = 512 * 1024  # 512 Ko : un cookies.txt réel pèse quelques Ko
+
+
+def get_cookies_args():
+    """Retourne ["--cookies", COOKIES_PATH] si un cookie jar valide est
+    présent sur disque, sinon [] (yt-dlp fonctionne alors sans, avec le
+    risque de blocage anti-bot habituel sur IP de datacenter)."""
+    if os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 0:
+        return ["--cookies", COOKIES_PATH]
+    return []
+
+
+if get_cookies_args():
+    logger.info("[cookies] Cookie jar présent au démarrage : %s", COOKIES_PATH)
+else:
+    logger.warning(
+        "[cookies] Aucun cookie jar présent (%s) — sur un VPS/datacenter, "
+        "YouTube bloque très souvent les requêtes sans cookies avec "
+        "'Sign in to confirm you're not a bot'. Envoie-en un via POST /admin/cookies.",
+        COOKIES_PATH,
+    )
+
 # ── Configuration ───────────────────────────────────────────────
 SERVICE_SECRET = os.environ.get("SERVICE_SECRET")
 CENTRAL_URL = os.environ.get("CENTRAL_URL")
@@ -113,12 +145,15 @@ scheduler.start()
 
 
 app = Flask(__name__)
+# Filet de sécurité global : aucune requête (y compris un upload de cookies)
+# ne doit pouvoir envoyer un corps de plusieurs dizaines de Mo à ce service.
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 Mo
 
 CORS(
     app,
     origins="*",
     supports_credentials=True,
-    methods=["GET", "POST"],
+    methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type", "X-Service-Secret"],
 )
 
@@ -184,6 +219,15 @@ def is_valid_url(url: str) -> bool:
 
 def parse_ytdlp_error(stderr: str = "") -> str:
     s = stderr.lower()
+    # À distinguer d'un vrai "sign in required" (vidéo membres/privée) :
+    # ce message précis signale le blocage anti-bot de YouTube sur les IP
+    # de datacenter, pas une restriction propre à la vidéo. Se règle avec
+    # des cookies (voir POST /admin/cookies), pas en se connectant "à la vidéo".
+    if "confirm you're not a bot" in s or "confirm you are not a bot" in s:
+        return (
+            "La plateforme bloque temporairement les requêtes depuis ce serveur "
+            "(vérification anti-robot). Réessaie plus tard, ou contacte le support."
+        )
     if "http error 429" in s or "too many requests" in s:
         return "La plateforme limite temporairement les requêtes (erreur 429). Patiente quelques minutes puis réessaie."
     if "unable to download video subtitles" in s or "video subtitles for" in s:
@@ -271,10 +315,6 @@ def get_target_height(quality: str) -> int:
 
 
 def get_video_format_selector(target_height: int) -> str:
-    # 1. H.264 MP4 + audio AAC → lisible partout, copiable sans ré-encodage.
-    # 2. N'importe quel MP4 + M4A → remux rapide.
-    # 3. Meilleurs flux séparés quelconques.
-    # 4. Meilleur flux progressif <= hauteur cible.
     h = target_height
     return "/".join([
         f"bestvideo[height<={h}][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]",
@@ -288,10 +328,6 @@ FORMAT_STRING_RE = re.compile(r"^[\w+,\-\[\]<>=./: ]+$")
 
 
 def is_valid_format_string(fmt: str) -> bool:
-    # Un sélecteur de format yt-dlp valide n'utilise qu'un jeu de caractères
-    # restreint. Revalidé ici en défense en profondeur, même si Node valide
-    # déjà côté appelant — c'est CE service qui exécute réellement le
-    # subprocess avec cette valeur.
     return bool(fmt) and len(fmt) <= 150 and bool(FORMAT_STRING_RE.match(fmt))
 
 
@@ -317,14 +353,6 @@ def probe_streams(filepath: str):
 
 
 def finalize_video(filepath: str, target_height: int, subtitle_path: str = None, subtitle_lang: str = "und"):
-    """
-    Finalise le fichier téléchargé en UNE passe ffmpeg :
-    - copie la vidéo H.264 si déjà au bon format (sinon ré-encodage H.264),
-    - copie l'audio AAC si déjà compatible (sinon ré-encodage AAC),
-    - embarque un fichier de sous-titres .srt en piste mov_text si fourni,
-    - applique +faststart pour un démarrage immédiat.
-    Le fast-path (copie) prend quelques secondes au lieu d'un long ré-encodage.
-    """
     converted_path = f"{filepath}.converted.mp4"
     video, audio = probe_streams(filepath)
 
@@ -390,10 +418,6 @@ MAX_COVER_BYTES = 5 * 1024 * 1024  # 5 Mo, largement suffisant pour une cover
 
 
 def download_cover_image(url: str, dest_path: str):
-    """Télécharge une image de couverture, avec la même protection SSRF que
-    pour les vidéos (même si l'URL provient typiquement d'une API tierce de
-    confiance comme Shazam, c'est une URL externe fournie dans un body de
-    requête — défense en profondeur)."""
     assert_public_http_url(url)
     req = Request(url, headers={"User-Agent": YTDLP_UA})
     with urlopen(req, timeout=10) as resp:
@@ -405,18 +429,12 @@ def download_cover_image(url: str, dest_path: str):
 
 
 def finalize_audio_with_metadata(filepath: str, title: str = None, artist: str = None, cover_path: str = None):
-    """
-    Ré-encode l'audio en MP3 en embarquant les métadonnées ID3 (titre/artiste)
-    et, si fournie, une pochette en tant que piste vidéo attachée (norme ID3
-    standard pour l'art de couverture). Porté depuis bot.js (transcodeAudio).
-    """
     converted_path = f"{filepath}.converted.mp3"
     args = ["ffmpeg", "-y", "-i", filepath]
 
     if cover_path:
         args += ["-i", cover_path, "-map", "0:a", "-map", "1:0"]
     else:
-        # Préserve une éventuelle miniature déjà embarquée par yt-dlp.
         args += ["-map", "0:a", "-map", "0:v?"]
 
     args += ["-c:a", "libmp3lame", "-q:a", "2", "-c:v", "copy", "-map_metadata", "0", "-id3v2_version", "3"]
@@ -445,11 +463,6 @@ def finalize_audio_with_metadata(filepath: str, title: str = None, artist: str =
 # ─────────────────────────────────────────────────────────────────
 #  Sous-titres — téléchargement robuste (porté depuis server.js)
 # ─────────────────────────────────────────────────────────────────
-# YouTube limite fortement son endpoint de sous-titres (429 fréquent,
-# surtout pour les légendes auto-traduites). On télécharge donc le fichier
-# de sous-titres SÉPARÉMENT de la vidéo (jamais via --embed-subs, trop
-# fragile — c'était la cause de notre bug "sous-titres non fusionnés"),
-# avec plusieurs tentatives, puis on l'embarque nous-mêmes via ffmpeg.
 
 SUBTITLE_MAX_ATTEMPTS = 5
 SUBTITLE_RETRY_DELAYS = [1.5, 3, 6, 10]
@@ -522,6 +535,7 @@ def attempt_subtitle_download(url: str, lang: str, out_base: str):
                 "--extractor-retries", "2",
                 "--sleep-subtitles", "1",
                 "--user-agent", YTDLP_UA,
+                *get_cookies_args(),
                 url,
             ],
             capture_output=True, text=True, timeout=90,
@@ -558,10 +572,6 @@ def download_subtitle_file(url: str, lang: str, out_base: str):
 # ─────────────────────────────────────────────────────────────────
 #  Nettoyage disque — porté depuis server.js
 # ─────────────────────────────────────────────────────────────────
-# Balaie TMP_DIR sur le disque (pas seulement la Map en mémoire) et
-# supprime tout fichier plus vieux que max_age_seconds. Rattrape les
-# fichiers orphelins qu'un job perdu (crash serveur) laisserait sinon
-# indéfiniment sur le disque.
 
 def sweep_stale_tmp_files(max_age_seconds: float):
     try:
@@ -651,13 +661,118 @@ def health():
     with jobs_lock:
         active_jobs = len(jobs)
 
-    return jsonify({"status": "ok", "ytdlp": ytdlp_version, "activeJobs": active_jobs})
+    return jsonify({
+        "status": "ok",
+        "ytdlp": ytdlp_version,
+        "activeJobs": active_jobs,
+        "cookies_present": bool(get_cookies_args()),
+    })
 
 
 @app.post("/admin/update-ytdlp")
 @require_secret
 def trigger_update():
     update_ytdlp()
+    return jsonify({"success": True})
+
+
+# ─────────────────────────────────────────────────────────────────
+#  COOKIES — upload/statut/suppression du cookie jar YouTube
+# ─────────────────────────────────────────────────────────────────
+# But : ne plus jamais avoir à se connecter en SSH au VPS pour renouveler
+# les cookies. Node peut appeler cet endpoint (par ex. depuis un petit
+# panneau d'admin interne) avec le contenu d'un cookies.txt fraîchement
+# exporté, quel que soit son nom de fichier d'origine — il est toujours
+# réécrit sous le même chemin fixe (COOKIES_PATH) que yt-dlp utilise.
+
+def looks_like_netscape_cookiejar(content: bytes) -> bool:
+    """
+    Validation légère : un cookies.txt Netscape valide contient au moins
+    une ligne de données à 7 champs séparés par des tabulations
+    (domain, include_subdomains, path, secure, expiry, name, value).
+    Ça n'authentifie pas le contenu (impossible sans l'utiliser), mais ça
+    évite d'écraser un cookie jar fonctionnel avec un fichier n'importe quoi
+    (JSON, HTML d'une page d'erreur, fichier vide, etc.).
+    """
+    try:
+        text = content.decode("utf-8", errors="ignore")
+    except Exception:
+        return False
+    lines = [l for l in text.splitlines() if l.strip() and not l.strip().startswith("#")]
+    if not lines:
+        return False
+    return any(len(l.split("\t")) >= 7 for l in lines)
+
+
+@app.get("/admin/cookies/status")
+@require_secret
+def cookies_status():
+    if not os.path.exists(COOKIES_PATH):
+        return jsonify({"present": False})
+    stat = os.stat(COOKIES_PATH)
+    return jsonify({
+        "present": stat.st_size > 0,
+        "size": stat.st_size,
+        "updated_at": stat.st_mtime,
+        "age_seconds": round(time.time() - stat.st_mtime),
+    })
+
+
+@app.post("/admin/cookies")
+@require_secret
+def upload_cookies():
+    # Deux façons d'envoyer le fichier, au choix côté Node :
+    #  1) multipart/form-data avec un champ "cookies" (n'importe quel nom de
+    #     fichier réel, ex. "cookies (3).txt" — il est ignoré, seul le
+    #     contenu compte)
+    #  2) corps brut (Content-Type: text/plain ou application/octet-stream)
+    content = None
+
+    if "cookies" in request.files:
+        content = request.files["cookies"].read(MAX_COOKIES_BYTES + 1)
+    elif request.data:
+        content = request.get_data(cache=False)
+
+    if not content:
+        return jsonify({"error": "Aucun contenu de cookies fourni."}), 400
+    if len(content) > MAX_COOKIES_BYTES:
+        return jsonify({"error": "Fichier de cookies trop volumineux."}), 400
+    if not looks_like_netscape_cookiejar(content):
+        return jsonify({
+            "error": "Contenu invalide : ce n'est pas un cookies.txt au format Netscape "
+                     "(attendu : lignes 'domain\\tinclude_subdomains\\tpath\\tsecure\\texpiry\\tname\\tvalue')."
+        }), 400
+
+    tmp_path = COOKIES_PATH + ".tmp"
+    try:
+        with open(tmp_path, "wb") as fh:
+            fh.write(content)
+        os.replace(tmp_path, COOKIES_PATH)  # remplacement atomique
+        try:
+            os.chmod(COOKIES_PATH, 0o600)  # contient des jetons de session : lecture propriétaire uniquement
+        except OSError:
+            pass
+    except OSError as e:
+        return jsonify({"error": f"Écriture impossible sur le serveur : {e}"}), 500
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    logger.info("[cookies] Cookie jar mis à jour avec succès (%d octets).", len(content))
+    return jsonify({"success": True, "size": len(content)})
+
+
+@app.delete("/admin/cookies")
+@require_secret
+def delete_cookies():
+    if os.path.exists(COOKIES_PATH):
+        try:
+            os.remove(COOKIES_PATH)
+        except OSError as e:
+            return jsonify({"error": str(e)}), 500
     return jsonify({"success": True})
 
 
@@ -681,7 +796,7 @@ def analyze():
     try:
         proc = subprocess.run(
             ["yt-dlp", "--dump-single-json", "--no-warnings", "--no-playlist",
-             "--user-agent", YTDLP_UA, url],
+             "--user-agent", YTDLP_UA, *get_cookies_args(), url],
             capture_output=True, text=True, timeout=ANALYZE_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
@@ -698,8 +813,6 @@ def analyze():
     except json.JSONDecodeError:
         return jsonify({"error": "Réponse yt-dlp invalide. Réessaie."}), 502
 
-    # On écarte les storyboards (vcodec "images" / ext mhtml), sans intérêt et
-    # qui poussaient les vrais formats 4K/1440p hors de la limite.
     raw_formats = [f for f in (data.get("formats") or []) if f.get("vcodec") != "images" and f.get("ext") != "mhtml"]
     formats = []
     for f in raw_formats[:80]:
@@ -781,7 +894,6 @@ def download_start():
 
     is_audio = quality in ("mp3", "audio") or (fmt and "bestaudio" in fmt and "bestvideo" not in fmt)
 
-    # ── Découpage vidéo sur mesure ──────────────────────────────────
     trim_sections = None
     if trim in (True, "true"):
         if not (start_time and TRIM_TIME_RE.match(str(start_time)) and end_time and TRIM_TIME_RE.match(str(end_time))):
@@ -839,7 +951,7 @@ def download_start():
     if trim_sections:
         args += ["--download-sections", trim_sections, "--force-keyframes-at-cuts"]
 
-    args += ["--user-agent", YTDLP_UA, url]
+    args += ["--user-agent", YTDLP_UA, *get_cookies_args(), url]
 
     def run_job():
         try:
@@ -854,7 +966,6 @@ def download_start():
             sse_close(job_id)
             return
 
-        # Watchdog : tue le process si le job traîne trop longtemps.
         watchdog_fired = threading.Event()
 
         def watchdog():
@@ -875,8 +986,6 @@ def download_start():
         watchdog_thread = threading.Thread(target=watchdog, daemon=True)
         watchdog_thread.start()
 
-        # Drain stderr en parallèle (évite un deadlock si ffmpeg/yt-dlp
-        # produit beaucoup de sortie stderr pendant que stdout attend).
         stderr_lines = []
 
         def drain_stderr():
@@ -886,9 +995,6 @@ def download_start():
         stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
         stderr_thread.start()
 
-        # Progression agrégée sur l'ensemble des flux (vidéo puis audio) :
-        # yt-dlp redémarre son compteur à 0% par flux, on reconstitue une
-        # progression monotone 0→99%.
         expected_streams = 1
         stream_index = 0
         best_percent = 0.0
@@ -941,7 +1047,6 @@ def download_start():
             sse_close(job_id)
             return
 
-        # ── Finalisation : sous-titres (best-effort) + remux/ré-encodage ──
         with jobs_lock:
             j = jobs.get(job_id)
             if j:
@@ -995,11 +1100,6 @@ def download_start():
 # ─────────────────────────────────────────────────────────────────
 #  RECHERCHE MUSICALE DÉDIÉE (job en arrière-plan)
 # ─────────────────────────────────────────────────────────────────
-# Endpoint séparé de /download/start, volontairement : ici on sait déjà
-# qu'on veut un MP3 avec métadonnées/pochette embarquées à partir d'une
-# recherche texte (ytsearch1:...), jamais une URL arbitraire fournie par
-# l'utilisateur final — pas de logique conditionnelle mêlée à la route
-# générique.
 
 QUERY_MAX_LENGTH = 200
 
@@ -1026,11 +1126,6 @@ def download_music():
             "code": "SERVER_BUSY",
         }), 503
 
-    # ytsearch1:... n'est jamais une adresse réseau arbitraire fournie par
-    # l'utilisateur — yt-dlp résout toujours cette syntaxe contre l'endpoint
-    # de recherche YouTube lui-même, jamais contre une destination choisie
-    # par l'appelant. Pas de vérification SSRF nécessaire ici (contrairement
-    # à /analyze et /download/start qui reçoivent une vraie URL).
     search_url = f"ytsearch1:{query}"
 
     job_id = uuid.uuid4().hex
@@ -1052,6 +1147,7 @@ def download_music():
         "--no-warnings", "--no-playlist", "--no-mtime",
         "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
         "--user-agent", YTDLP_UA,
+        *get_cookies_args(),
         search_url,
     ]
 

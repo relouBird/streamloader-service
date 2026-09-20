@@ -163,6 +163,10 @@ ENV/
 env.bak/
 venv.bak/
 
+# Gestion des cookies
+cookies
+cookies.txt
+
 # Spyder project settings
 .spyderproject
 .spyproject
