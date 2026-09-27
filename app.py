@@ -2,11 +2,24 @@
 video-service — Worker Python isolé pour StreamLoader
 ──────────────────────────────────────────────────────
 Rôle UNIQUE : parler à yt-dlp/ffmpeg (analyse, téléchargement, sous-titres,
-progression, fichier). Appelé exclusivement par le backend Node via le
-header `X-Service-Secret` — aucune notion d'utilisateur, d'auth JWT, de
-paiement ou de quota ici : tout ça reste dans Node (le Node est celui qui
-décide QUI a le droit de demander quoi ; ce service exécute simplement la
-demande, avec ses propres garde-fous techniques : SSRF, concurrence, DoS).
+progression, fichier, file d'attente). Appelé exclusivement par le backend
+Node via le header `X-Service-Secret` — aucune notion d'utilisateur, d'auth
+JWT, de paiement ou de QUOTA (limites journalières, restriction 4K, essais
+gratuits de découpage…) ici : tout ça reste dans Node, qui décide QUI a le
+droit de demander QUOI avant d'appeler ce service.
+
+Ce service gère en revanche ses propres garde-fous TECHNIQUES, ceux qui
+protègent la machine qui exécute réellement yt-dlp/ffmpeg (CPU, bande
+passante, disque) plutôt qu'un compte utilisateur : SSRF, file d'attente
+pondérée par taille estimée, priorité Premium, détection de visiteur absent/
+abandonné, watchdog anti-blocage.
+
+Node peut transmettre deux informations à titre indicatif pour cette file
+d'attente (aucune valeur de confiance/sécurité, juste de la priorisation) :
+  - `premium` (bool)  : place ce job devant les jobs gratuits déjà en attente
+  - `source` ("web"|"api") : seuls les jobs "web" peuvent être considérés
+    "absents" (liés à une page ouverte dans un navigateur) ; un job "api"
+    (intégrateur tiers) n'est jamais sauté pour absence.
 
 Routes :
   GET  /                       → info service
@@ -14,7 +27,8 @@ Routes :
   POST /admin/update-ytdlp     → force la mise à jour de yt-dlp (cron externe)
   POST /analyze                → { url } -> infos vidéo + formats + sous-titres
   POST /download/start         → { url, quality|format, title, sublang,
-                                    trim, startTime, endTime } -> { jobId }
+                                    trim, startTime, endTime, premium, source }
+                                  -> { jobId }
   GET  /progress/<job_id>      → SSE de progression du téléchargement
   GET  /file/<job_id>          → stream + suppression du fichier une fois livré
 """
@@ -54,10 +68,11 @@ FFMPEG_DIR = os.path.join(BASE_DIR, "ffmpeg")
 os.environ["PATH"] = FFMPEG_DIR + os.pathsep + os.environ["PATH"]
 
 # ── User-Agent commun à toutes les invocations yt-dlp ────────────
-# ⚠️ IMPORTANT : on n'impose plus de --extractor-args youtube:player_client=...
-# Le client par défaut de yt-dlp expose la pleine gamme de résolutions (jusqu'en
-# 4K), alors que forcer le client "android" plafonnait à 360p/720p et produisait
-# des vidéos floues — porté depuis la dernière version de server.js.
+# ⚠️ IMPORTANT : on n'impose AUCUN --extractor-args youtube:player_client=...
+# ni de cookies. Le client par défaut de yt-dlp expose la pleine gamme de
+# résolutions (jusqu'en 4K), alors que forcer un client type "android"
+# plafonnait à 360p/720p et produisait des vidéos floues — comportement
+# volontairement identique à celui de server.js.
 YTDLP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -74,13 +89,33 @@ TMP_DIR = os.environ.get(
 )
 os.makedirs(TMP_DIR, exist_ok=True)
 
-JOB_TTL_SECONDS = 15 * 60
+# ── Durées de vie (portées depuis server.js) ─────────────────────
+# Un fichier prêt mais jamais récupéré est supprimé 5 min après la FIN du
+# téléchargement (pas après son début : une longue vidéo peut mettre plus de
+# 5 min à se télécharger). Un job qui ne finit jamais (bloqué) est abandonné
+# après 4h — bien au-delà du watchdog (15 min), qui lui gère un yt-dlp figé.
+FINISHED_JOB_TTL_SECONDS = 5 * 60
+STUCK_JOB_MAX_SECONDS = 4 * 60 * 60
 ANALYZE_TIMEOUT = 60
-# Filet de sécurité DoS : pas plus de MAX_CONCURRENT_JOBS téléchargements
-# yt-dlp/ffmpeg en même temps, tous appelants confondus.
-MAX_CONCURRENT_JOBS = 12
-# Un job ne doit jamais rester bloqué indéfiniment.
 JOB_WATCHDOG_SECONDS = 15 * 60
+
+# ── File d'attente des téléchargements (portée depuis server.js) ─
+# Dimensionnée pour la bande passante du VPS : un fichier de plus de
+# LARGE_FILE_BYTES compte double (2 unités), les autres 1 unité — soit
+# DOWNLOAD_CAPACITY_UNITS petits fichiers en même temps, ou moitié moins de
+# gros. Tant que la taille réelle n'est pas connue (avant la première ligne
+# de progression avec une taille annoncée), un job compte comme "gros" par
+# prudence — jobWeight en JS faisait exactement ce choix.
+DOWNLOAD_CAPACITY_UNITS = 10
+LARGE_FILE_BYTES = 300 * 1024 * 1024
+MAX_QUEUED_JOBS = 100
+# Un visiteur dont la page n'est plus connectée (aucun abonné SSE vivant)
+# depuis plus de QUEUE_ABSENT_GRACE_SECONDS garde sa place en file mais ne
+# bloque pas les autres (on saute juste son tour). Au-delà de
+# QUEUE_ABANDON_SECONDS, on considère la page fermée et on le retire.
+# Ne s'applique qu'aux jobs source="web" — jamais aux jobs "api".
+QUEUE_ABSENT_GRACE_SECONDS = 60
+QUEUE_ABANDON_SECONDS = 30 * 60
 
 TRIM_TIME_RE = re.compile(r"^\d{1,2}(:\d{2}){1,2}$")
 
@@ -179,7 +214,7 @@ def is_valid_url(url: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────
-#  yt-dlp — parsing (porté depuis server.js, enrichi 429/sous-titres)
+#  yt-dlp — parsing (porté depuis server.js)
 # ─────────────────────────────────────────────────────────────────
 
 def parse_ytdlp_error(stderr: str = "") -> str:
@@ -214,11 +249,13 @@ def parse_ytdlp_error(stderr: str = "") -> str:
 
 
 PROGRESS_RE = re.compile(
-    r"\[download\]\s+([\d.]+)%\s+of\s+([\d.]+\s*\S+)\s+at\s+([\d.]+\s*\S+/s)"
-    r"(?:\s+ETA\s+([\d:]+))?"
+    r"\[download\]\s+([\d.]+)%\s+of\s+~?\s*([\d.]+\s*\S+)\s+at\s+([\d.]+\s*\S+/s|Unknown\s*\S*)"
+    r"(?:\s+ETA\s+(\S+))?"
 )
 DOWNLOADING_FORMATS_RE = re.compile(r"Downloading (\d+) format\(s?\)(?::\s*(\S+))?", re.IGNORECASE)
 DESTINATION_RE = re.compile(r"\[download\]\s+Destination:", re.IGNORECASE)
+# "130.74MiB" / "1.2GiB" / "850KiB" (format des lignes de progression yt-dlp) → octets.
+SIZE_RE = re.compile(r"([\d.]+)\s*([KMGT]?)(i?)B", re.IGNORECASE)
 
 
 def parse_ytdlp_progress(line: str):
@@ -231,6 +268,15 @@ def parse_ytdlp_progress(line: str):
         "speed": m.group(3).strip(),
         "eta": m.group(4),
     }
+
+
+def parse_size_to_bytes(s):
+    m = SIZE_RE.search(s or "")
+    if not m:
+        return None
+    base = 1024 if m.group(3) else 1000
+    power = {"": 0, "K": 1, "M": 2, "G": 3, "T": 4}[m.group(2).upper()]
+    return float(m.group(1)) * (base ** power)
 
 
 def parse_time_to_seconds(t: str):
@@ -448,8 +494,8 @@ def finalize_audio_with_metadata(filepath: str, title: str = None, artist: str =
 # YouTube limite fortement son endpoint de sous-titres (429 fréquent,
 # surtout pour les légendes auto-traduites). On télécharge donc le fichier
 # de sous-titres SÉPARÉMENT de la vidéo (jamais via --embed-subs, trop
-# fragile — c'était la cause de notre bug "sous-titres non fusionnés"),
-# avec plusieurs tentatives, puis on l'embarque nous-mêmes via ffmpeg.
+# fragile), avec plusieurs tentatives, puis on l'embarque nous-mêmes via
+# ffmpeg dans finalize_video().
 
 SUBTITLE_MAX_ATTEMPTS = 5
 SUBTITLE_RETRY_DELAYS = [1.5, 3, 6, 10]
@@ -558,10 +604,6 @@ def download_subtitle_file(url: str, lang: str, out_base: str):
 # ─────────────────────────────────────────────────────────────────
 #  Nettoyage disque — porté depuis server.js
 # ─────────────────────────────────────────────────────────────────
-# Balaie TMP_DIR sur le disque (pas seulement la Map en mémoire) et
-# supprime tout fichier plus vieux que max_age_seconds. Rattrape les
-# fichiers orphelins qu'un job perdu (crash serveur) laisserait sinon
-# indéfiniment sur le disque.
 
 def sweep_stale_tmp_files(max_age_seconds: float):
     try:
@@ -609,12 +651,144 @@ def sse_close(job_id):
         q.put(None)
 
 
+def has_live_subscribers(job_id) -> bool:
+    with sse_lock:
+        return bool(sse_queues.get(job_id))
+
+
+# ─────────────────────────────────────────────────────────────────
+#  FILE D'ATTENTE DES TÉLÉCHARGEMENTS — portée depuis server.js
+# ─────────────────────────────────────────────────────────────────
+# Premium avant gratuits, ordre d'arrivée conservé dans chaque groupe.
+# Aucun téléchargement en cours n'est interrompu pour faire de la place.
+# download_queue : liste de {"job_id", "premium", "start"} protégée par
+# jobs_lock (même verrou que le dict `jobs`, pour éviter tout état incohérent
+# entre les deux structures qui évoluent toujours ensemble).
+
+download_queue = []  # [{"job_id": str, "premium": bool, "start": callable}]
+
+
+def job_weight(job) -> int:
+    eb = job.get("estimated_bytes")
+    return 2 if (eb is None or eb > LARGE_FILE_BYTES) else 1
+
+
+def used_capacity_units() -> int:
+    return sum(job_weight(j) for j in jobs.values() if j.get("running"))
+
+
+def absent_since_seconds(job, now=None) -> float:
+    """Combien de temps ce job est "absent" (page fermée / SSE déconnecté).
+    Toujours 0 pour un job source="api" (pas de notion de page ouverte)."""
+    if job.get("source") != "web":
+        return 0
+    if has_live_subscribers(job["id"]):
+        return 0
+    now = now if now is not None else time.time()
+    return now - job.get("last_seen", job["created_at"])
+
+
+def is_job_absent(job, now=None) -> bool:
+    return absent_since_seconds(job, now) > QUEUE_ABSENT_GRACE_SECONDS
+
+
+def notify_queue_positions():
+    position = 0
+    for entry in download_queue:
+        job = jobs.get(entry["job_id"])
+        if not job or is_job_absent(job):
+            continue
+        position += 1
+        job["status"] = "queued"
+        job["queue_position"] = position
+        sse_emit(entry["job_id"], {"type": "queued", "position": position, "premium": entry["premium"]})
+
+
+def schedule_downloads():
+    """Démarre autant de jobs en attente que la capacité le permet, en
+    sautant (sans les retirer) ceux dont le visiteur est actuellement absent."""
+    with jobs_lock:
+        i = 0
+        while i < len(download_queue):
+            entry = download_queue[i]
+            job = jobs.get(entry["job_id"])
+            if not job:
+                download_queue.pop(i)
+                continue
+            if is_job_absent(job):
+                i += 1  # garde sa place, laisse passer les suivants
+                continue
+            if used_capacity_units() + job_weight(job) > DOWNLOAD_CAPACITY_UNITS:
+                break
+            download_queue.pop(i)
+            job["running"] = True
+            job["status"] = "starting"
+            job["queue_position"] = None
+            entry["start"]()
+        notify_queue_positions()
+
+
+def drop_abandoned_queued_jobs():
+    now = time.time()
+    with jobs_lock:
+        i = len(download_queue) - 1
+        while i >= 0:
+            entry = download_queue[i]
+            job = jobs.get(entry["job_id"])
+            if job and absent_since_seconds(job, now) > QUEUE_ABANDON_SECONDS:
+                download_queue.pop(i)
+                jobs.pop(entry["job_id"], None)
+                logger.info("[queue] job %s abandonné (page fermée depuis trop longtemps)", entry["job_id"])
+            i -= 1
+
+
+def enqueue_download(job_id, premium, start_fn):
+    with jobs_lock:
+        entry = {"job_id": job_id, "premium": premium, "start": start_fn}
+        if premium:
+            insert_at = next((idx for idx, e in enumerate(download_queue) if not e["premium"]), len(download_queue))
+        else:
+            insert_at = len(download_queue)
+        download_queue.insert(insert_at, entry)
+    schedule_downloads()
+
+
+def release_download_slot(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job:
+            job["running"] = False
+    schedule_downloads()
+
+
+def queue_ticker_loop():
+    """Complète les déclencheurs événementiels (enqueue/release/reconnexion
+    SSE) : réévalue périodiquement la file pour rattraper les cas purement
+    temporels — un visiteur qui redevient absent/abandonné sans nouvel
+    événement réseau, par exemple."""
+    while True:
+        time.sleep(10)
+        drop_abandoned_queued_jobs()
+        schedule_downloads()
+
+
+threading.Thread(target=queue_ticker_loop, daemon=True).start()
+
+
 def cleanup_loop():
     while True:
-        time.sleep(10 * 60)
+        time.sleep(60)
         now = time.time()
+        expired = []
         with jobs_lock:
-            expired = [jid for jid, j in jobs.items() if now - j["created_at"] > JOB_TTL_SECONDS]
+            for jid, j in jobs.items():
+                if j["status"] in ("done", "error"):
+                    ref = j.get("finished_at") or j["created_at"]
+                    if now - ref > FINISHED_JOB_TTL_SECONDS:
+                        expired.append(jid)
+                else:
+                    if now - j["created_at"] > STUCK_JOB_MAX_SECONDS:
+                        expired.append(jid)
             for jid in expired:
                 j = jobs.pop(jid)
                 fp = j.get("filepath")
@@ -650,8 +824,19 @@ def health():
 
     with jobs_lock:
         active_jobs = len(jobs)
+        running_jobs = sum(1 for j in jobs.values() if j.get("running"))
+        queued_jobs = len(download_queue)
+        capacity_used = used_capacity_units()
 
-    return jsonify({"status": "ok", "ytdlp": ytdlp_version, "activeJobs": active_jobs})
+    return jsonify({
+        "status": "ok",
+        "ytdlp": ytdlp_version,
+        "activeJobs": active_jobs,
+        "runningJobs": running_jobs,
+        "queuedJobs": queued_jobs,
+        "capacityUsed": capacity_used,
+        "capacityTotal": DOWNLOAD_CAPACITY_UNITS,
+    })
 
 
 @app.post("/admin/update-ytdlp")
@@ -748,7 +933,7 @@ def analyze():
 
 
 # ─────────────────────────────────────────────────────────────────
-#  DÉMARRAGE D'UN TÉLÉCHARGEMENT (job en arrière-plan)
+#  DÉMARRAGE D'UN TÉLÉCHARGEMENT (mis en file d'attente)
 # ─────────────────────────────────────────────────────────────────
 
 @app.post("/download/start")
@@ -763,6 +948,11 @@ def download_start():
     trim = body.get("trim")
     start_time = body.get("startTime")
     end_time = body.get("endTime")
+    # Indicatif uniquement (priorisation de file) — Node reste seul juge de
+    # qui est réellement Premium ; ce service ne fait AUCUNE vérification
+    # d'identité et fait confiance à Node sous couvert du secret partagé.
+    premium = bool(body.get("premium"))
+    source = body.get("source") if body.get("source") in ("web", "api") else "web"
 
     if not url:
         return jsonify({"error": "URL manquante"}), 400
@@ -772,8 +962,8 @@ def download_start():
         return jsonify({"error": "URL invalide"}), 400
 
     with jobs_lock:
-        current_jobs = len(jobs)
-    if current_jobs >= MAX_CONCURRENT_JOBS:
+        queue_len = len(download_queue)
+    if queue_len >= MAX_QUEUED_JOBS:
         return jsonify({
             "error": "Le serveur est actuellement très sollicité. Réessaie dans quelques instants.",
             "code": "SERVER_BUSY",
@@ -781,7 +971,6 @@ def download_start():
 
     is_audio = quality in ("mp3", "audio") or (fmt and "bestaudio" in fmt and "bestvideo" not in fmt)
 
-    # ── Découpage vidéo sur mesure ──────────────────────────────────
     trim_sections = None
     if trim in (True, "true"):
         if not (start_time and TRIM_TIME_RE.match(str(start_time)) and end_time and TRIM_TIME_RE.match(str(end_time))):
@@ -810,7 +999,13 @@ def download_start():
 
     with jobs_lock:
         jobs[job_id] = {
-            "status": "starting",
+            "id": job_id,
+            "status": "queued",
+            "queue_position": None,
+            "running": False,
+            "premium": premium,
+            "source": source,
+            "estimated_bytes": None,
             "percent": 0,
             "speed": None,
             "eta": None,
@@ -819,6 +1014,8 @@ def download_start():
             "title": safe_title,
             "ext": ext,
             "created_at": time.time(),
+            "last_seen": time.time(),
+            "finished_at": None,
             "error": None,
         }
 
@@ -843,155 +1040,226 @@ def download_start():
 
     def run_job():
         try:
-            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-        except FileNotFoundError:
-            with jobs_lock:
-                j = jobs.get(job_id)
-                if j:
-                    j["status"] = "error"
-                    j["error"] = "yt-dlp introuvable sur le serveur."
-            sse_emit(job_id, {"type": "error", "message": "yt-dlp introuvable sur le serveur."})
-            sse_close(job_id)
-            return
-
-        # Watchdog : tue le process si le job traîne trop longtemps.
-        watchdog_fired = threading.Event()
-
-        def watchdog():
-            if not watchdog_fired.wait(JOB_WATCHDOG_SECONDS):
-                watchdog_fired.set()
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                with jobs_lock:
-                    j = jobs.get(job_id)
-                    if j and j["status"] not in ("done", "error"):
-                        j["status"] = "error"
-                        j["error"] = "Délai dépassé : le téléchargement a pris trop de temps. Réessaie."
-                sse_emit(job_id, {"type": "error", "message": "Délai dépassé : le téléchargement a pris trop de temps. Réessaie."})
-                sse_close(job_id)
-
-        watchdog_thread = threading.Thread(target=watchdog, daemon=True)
-        watchdog_thread.start()
-
-        # Drain stderr en parallèle (évite un deadlock si ffmpeg/yt-dlp
-        # produit beaucoup de sortie stderr pendant que stdout attend).
-        stderr_lines = []
-
-        def drain_stderr():
-            for line in proc.stderr:
-                stderr_lines.append(line)
-
-        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
-        stderr_thread.start()
-
-        # Progression agrégée sur l'ensemble des flux (vidéo puis audio) :
-        # yt-dlp redémarre son compteur à 0% par flux, on reconstitue une
-        # progression monotone 0→99%.
-        expected_streams = 1
-        stream_index = 0
-        best_percent = 0.0
-
-        for line in proc.stdout:
-            info = DOWNLOADING_FORMATS_RE.search(line)
-            if info:
-                spec = info.group(2) or ""
-                plus_count = spec.count("+")
-                expected_streams = max(1, int(info.group(1)), plus_count + 1)
-                continue
-            if DESTINATION_RE.search(line):
-                stream_index += 1
-                expected_streams = max(expected_streams, stream_index)
-                continue
-
-            progress = parse_ytdlp_progress(line)
-            if progress:
-                streams = max(expected_streams, stream_index, 1)
-                started_index = max(stream_index, 1)
-                overall = min(99.0, ((started_index - 1) + progress["percent"] / 100) / streams * 100)
-                best_percent = max(best_percent, overall)
-                with jobs_lock:
-                    j = jobs.get(job_id)
-                    if j:
-                        j["percent"] = best_percent
-                        j["speed"] = progress["speed"]
-                        j["eta"] = progress["eta"]
-                        j["total"] = progress["total"]
-                        j["status"] = "downloading"
-                sse_emit(job_id, {
-                    "type": "progress", "percent": best_percent,
-                    "stream": started_index, "streams": streams,
-                    "total": progress["total"], "speed": progress["speed"], "eta": progress["eta"],
-                })
-
-        code = proc.wait()
-        watchdog_fired.set()
-        stderr_thread.join(timeout=5)
-        stderr_output = "".join(stderr_lines)
-
-        if code != 0 or not os.path.exists(filepath):
-            logger.error("[download] yt-dlp a échoué (code=%s, job=%s)\nCommande: %s\nSTDERR:\n%s", code, job_id, " ".join(args), stderr_output)
-            with jobs_lock:
-                j = jobs.get(job_id)
-                if j:
-                    j["status"] = "error"
-                    j["error"] = parse_ytdlp_error(stderr_output)
-            sse_emit(job_id, {"type": "error", "message": parse_ytdlp_error(stderr_output)})
-            sse_close(job_id)
-            return
-
-        # ── Finalisation : sous-titres (best-effort) + remux/ré-encodage ──
-        with jobs_lock:
-            j = jobs.get(job_id)
-            if j:
-                j["status"] = "converting"
-                j["percent"] = 99
-        sse_emit(job_id, {
-            "type": "processing", "percent": 99.9,
-            "message": "Récupération des sous-titres et finalisation…" if normalized_sublang else "Finalisation et optimisation de la qualité…",
-        })
-
-        subtitle_path = None
-        try:
-            if not is_audio and normalized_sublang:
-                subtitle_path = download_subtitle_file(url, normalized_sublang, os.path.join(TMP_DIR, f"{job_id}_sub"))
-                if not subtitle_path:
-                    logger.warning("[download] %s : sous-titres '%s' indisponibles — vidéo sans sous-titres.", job_id, normalized_sublang)
-
-            if is_audio:
-                transcode_audio(filepath)
-            else:
-                finalize_video(filepath, target_height, subtitle_path, normalized_sublang or "und")
-        except Exception as e:
-            logger.error("[download] finalisation échouée job=%s : %s", job_id, e)
-            with jobs_lock:
-                j = jobs.get(job_id)
-                if j:
-                    j["status"] = "error"
-                    j["error"] = f"Conversion vidéo impossible : {e}"
-            sse_emit(job_id, {"type": "error", "message": f"Conversion vidéo impossible : {e}"})
-            sse_close(job_id)
-            return
+            _run_download_job(
+                job_id, args, filepath, url, is_audio, normalized_sublang,
+                target_height, safe_title, ext,
+            )
         finally:
-            if subtitle_path:
-                cleanup_subtitle_files(os.path.join(TMP_DIR, f"{job_id}_sub"))
+            # Quel que soit le chemin de sortie (succès, erreur, exception
+            # inattendue), la place en capacité DOIT être rendue, sinon la
+            # file d'attente se bloque progressivement pour tout le monde.
+            release_download_slot(job_id)
 
-        with jobs_lock:
-            j = jobs.get(job_id)
-            if j is None:
-                return
-            j["status"] = "done"
-            j["percent"] = 100
-
-        sse_emit(job_id, {"type": "done", "jobId": job_id, "title": safe_title, "ext": ext})
-        sse_close(job_id)
-
-    threading.Thread(target=run_job, daemon=True).start()
+    enqueue_download(job_id, premium, lambda: threading.Thread(target=run_job, daemon=True).start())
 
     return jsonify({"success": True, "jobId": job_id})
 
 
+def _run_download_job(job_id, args, filepath, url, is_audio, normalized_sublang, target_height, safe_title, ext):
+    try:
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    except FileNotFoundError:
+        with jobs_lock:
+            j = jobs.get(job_id)
+            if j:
+                j["status"] = "error"
+                j["error"] = "yt-dlp introuvable sur le serveur."
+        sse_emit(job_id, {"type": "error", "message": "yt-dlp introuvable sur le serveur."})
+        sse_close(job_id)
+        return
+
+    # Watchdog : tue le process si le job traîne trop longtemps.
+    watchdog_fired = threading.Event()
+
+    def watchdog():
+        if not watchdog_fired.wait(JOB_WATCHDOG_SECONDS):
+            watchdog_fired.set()
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            with jobs_lock:
+                j = jobs.get(job_id)
+                if j and j["status"] not in ("done", "error"):
+                    j["status"] = "error"
+                    j["error"] = "Délai dépassé : le téléchargement a pris trop de temps. Réessaie."
+            sse_emit(job_id, {"type": "error", "message": "Délai dépassé : le téléchargement a pris trop de temps. Réessaie."})
+            sse_close(job_id)
+
+    watchdog_thread = threading.Thread(target=watchdog, daemon=True)
+    watchdog_thread.start()
+
+    # Drain stderr en parallèle (évite un deadlock si ffmpeg/yt-dlp produit
+    # beaucoup de sortie stderr pendant que stdout attend).
+    stderr_lines = []
+
+    def drain_stderr():
+        for line in proc.stderr:
+            stderr_lines.append(line)
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    # Progression agrégée sur l'ensemble des flux (vidéo puis audio) : yt-dlp
+    # redémarre son compteur à 0% par flux, on reconstitue une progression
+    # monotone 0→99%. On accumule aussi la taille annoncée par flux, pour
+    # affiner le poids du job dans la file d'attente (voir job_weight()).
+    expected_streams = 1
+    stream_index = 0
+    best_percent = 0.0
+    stream_bytes = []
+
+    for line in proc.stdout:
+        info = DOWNLOADING_FORMATS_RE.search(line)
+        if info:
+            spec = info.group(2) or ""
+            plus_count = spec.count("+")
+            expected_streams = max(1, int(info.group(1)), plus_count + 1)
+            continue
+        if DESTINATION_RE.search(line):
+            stream_index += 1
+            expected_streams = max(expected_streams, stream_index)
+            continue
+
+        progress = parse_ytdlp_progress(line)
+        if progress:
+            streams = max(expected_streams, stream_index, 1)
+            started_index = max(stream_index, 1)
+            overall = min(99.0, ((started_index - 1) + progress["percent"] / 100) / streams * 100)
+            best_percent = max(best_percent, overall)
+
+            weight_dropped = False
+            with jobs_lock:
+                j = jobs.get(job_id)
+                if j:
+                    j["percent"] = best_percent
+                    j["speed"] = progress["speed"]
+                    j["eta"] = progress["eta"]
+                    j["total"] = progress["total"]
+                    j["status"] = "downloading"
+
+                    announced = parse_size_to_bytes(progress["total"])
+                    if announced:
+                        idx = started_index - 1
+                        while len(stream_bytes) <= idx:
+                            stream_bytes.append(None)
+                        stream_bytes[idx] = announced
+                        weight_before = job_weight(j)
+                        j["estimated_bytes"] = sum(b or 0 for b in stream_bytes)
+                        weight_dropped = job_weight(j) < weight_before
+
+            # La vraie taille remplace l'estimation prudente (poids 2 par
+            # défaut) : si le job s'avère plus léger que prévu, la place
+            # libérée profite immédiatement à la file d'attente.
+            if weight_dropped:
+                schedule_downloads()
+
+            sse_emit(job_id, {
+                "type": "progress", "percent": best_percent,
+                "stream": started_index, "streams": streams,
+                "total": progress["total"], "speed": progress["speed"], "eta": progress["eta"],
+            })
+
+    code = proc.wait()
+    watchdog_fired.set()
+    stderr_thread.join(timeout=5)
+    stderr_output = "".join(stderr_lines)
+
+    if code != 0 or not os.path.exists(filepath):
+        logger.error("[download] yt-dlp a échoué (code=%s, job=%s)\nCommande: %s\nSTDERR:\n%s", code, job_id, " ".join(args), stderr_output)
+        with jobs_lock:
+            j = jobs.get(job_id)
+            if j:
+                j["status"] = "error"
+                j["error"] = parse_ytdlp_error(stderr_output)
+                j["finished_at"] = time.time()
+        sse_emit(job_id, {"type": "error", "message": parse_ytdlp_error(stderr_output)})
+        sse_close(job_id)
+        return
+
+    # ── Finalisation : sous-titres (best-effort) + remux/ré-encodage ──
+    with jobs_lock:
+        j = jobs.get(job_id)
+        if j:
+            j["status"] = "converting"
+            j["percent"] = 99
+    sse_emit(job_id, {
+        "type": "processing", "percent": 99.9,
+        "message": "Récupération des sous-titres et finalisation…" if normalized_sublang else "Finalisation et optimisation de la qualité…",
+    })
+
+    subtitle_path = None
+    subtitles_embedded = False
+    try:
+        if not is_audio and normalized_sublang:
+            subtitle_path = download_subtitle_file(url, normalized_sublang, os.path.join(TMP_DIR, f"{job_id}_sub"))
+            subtitles_embedded = bool(subtitle_path)
+            if not subtitles_embedded:
+                logger.warning("[download] %s : sous-titres '%s' indisponibles — vidéo sans sous-titres.", job_id, normalized_sublang)
+
+        if is_audio:
+            transcode_audio(filepath)
+        else:
+            finalize_video(filepath, target_height, subtitle_path, normalized_sublang or "und")
+    except Exception as e:
+        logger.error("[download] finalisation échouée job=%s : %s", job_id, e)
+        with jobs_lock:
+            j = jobs.get(job_id)
+            if j:
+                j["status"] = "error"
+                j["error"] = f"Conversion vidéo impossible : {e}"
+                j["finished_at"] = time.time()
+        sse_emit(job_id, {"type": "error", "message": f"Conversion vidéo impossible : {e}"})
+        sse_close(job_id)
+        return
+    finally:
+        if subtitle_path:
+            cleanup_subtitle_files(os.path.join(TMP_DIR, f"{job_id}_sub"))
+
+    # ── Garde-fou : la résolution finale ne doit jamais dépasser la cible ──
+    # (défense en profondeur contre un bug de sélecteur de format qui aurait
+    # laissé passer une résolution supérieure à celle demandée/autorisée).
+    if not is_audio:
+        try:
+            verified_video, _ = probe_streams(filepath)
+        except Exception:
+            verified_video = None
+        final_height = int((verified_video or {}).get("height") or 0)
+        if final_height and final_height > target_height:
+            msg = f"Résolution finale invalide : {final_height}p pour un maximum de {target_height}p."
+            logger.error("[download] %s : %s", job_id, msg)
+            with jobs_lock:
+                j = jobs.get(job_id)
+                if j:
+                    j["status"] = "error"
+                    j["error"] = msg
+                    j["finished_at"] = time.time()
+            sse_emit(job_id, {"type": "error", "message": msg})
+            sse_close(job_id)
+            return
+        logger.info(
+            "[download] %s : requested=%sp final=%s codec=%s subtitles=%s",
+            job_id, target_height,
+            f"{verified_video.get('width')}x{verified_video.get('height')}" if verified_video else "inconnu",
+            (verified_video or {}).get("codec_name", "inconnu"),
+            normalized_sublang if subtitles_embedded else "none",
+        )
+
+    with jobs_lock:
+        j = jobs.get(job_id)
+        if j is None:
+            return
+        j["status"] = "done"
+        j["percent"] = 100
+        j["finished_at"] = time.time()
+
+    sse_emit(job_id, {
+        "type": "done", "jobId": job_id, "title": safe_title, "ext": ext,
+        "subtitles": subtitles_embedded,
+        "subtitleLang": normalized_sublang if subtitles_embedded else None,
+    })
+    sse_close(job_id)
+    
 # ─────────────────────────────────────────────────────────────────
 #  RECHERCHE MUSICALE DÉDIÉE (job en arrière-plan)
 # ─────────────────────────────────────────────────────────────────
@@ -1020,7 +1288,7 @@ def download_music():
 
     with jobs_lock:
         current_jobs = len(jobs)
-    if current_jobs >= MAX_CONCURRENT_JOBS:
+    if current_jobs >= MAX_QUEUED_JOBS:
         return jsonify({
             "error": "Le serveur est actuellement très sollicité. Réessaie dans quelques instants.",
             "code": "SERVER_BUSY",
@@ -1151,6 +1419,11 @@ def download_music():
 
     return jsonify({"success": True, "jobId": job_id})
 
+
+# ─────────────────────────────────────────────────────────────────
+#  PROGRESSION (Server-Sent Events)
+# ─────────────────────────────────────────────────────────────────
+
 @app.get("/progress/<job_id>")
 @require_secret
 def progress(job_id):
@@ -1171,16 +1444,33 @@ def progress(job_id):
             yield "data: " + json.dumps({"type": "error", "message": job_snapshot["error"]}) + "\n\n"
         return Response(gen_err(), mimetype="text/event-stream")
 
+    with jobs_lock:
+        j = jobs.get(job_id)
+        if j:
+            j["last_seen"] = time.time()
+
     q = queue.Queue()
     with sse_lock:
         sse_queues.setdefault(job_id, []).append(q)
 
     def gen():
-        yield "data: " + json.dumps({
-            "type": "progress",
-            "percent": job_snapshot["percent"], "speed": job_snapshot["speed"],
-            "eta": job_snapshot["eta"], "total": job_snapshot["total"],
-        }) + "\n\n"
+        if job_snapshot["status"] == "queued":
+            yield "data: " + json.dumps({
+                "type": "queued", "position": job_snapshot.get("queue_position"),
+            }) + "\n\n"
+        else:
+            yield "data: " + json.dumps({
+                "type": "progress",
+                "percent": job_snapshot["percent"], "speed": job_snapshot["speed"],
+                "eta": job_snapshot["eta"], "total": job_snapshot["total"],
+            }) + "\n\n"
+
+        # Un visiteur qui revient (nouvel onglet SSE) sur un job en attente
+        # peut débloquer la file si sa présence était ce qui manquait pour
+        # ne plus le considérer comme "absent".
+        if job_snapshot["status"] == "queued":
+            schedule_downloads()
+
         try:
             while True:
                 try:
@@ -1198,6 +1488,10 @@ def progress(job_id):
                 subscribers = sse_queues.get(job_id)
                 if subscribers and q in subscribers:
                     subscribers.remove(q)
+            with jobs_lock:
+                j = jobs.get(job_id)
+                if j:
+                    j["last_seen"] = time.time()  # l'absence se compte à partir de la déconnexion
 
     headers = {"Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
     return Response(stream_with_context(gen()), mimetype="text/event-stream", headers=headers)
