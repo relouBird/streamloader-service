@@ -91,8 +91,8 @@ os.makedirs(TMP_DIR, exist_ok=True)
 
 # ── Durées de vie (portées depuis server.js) ─────────────────────
 # Un fichier prêt mais jamais récupéré est supprimé 5 min après la FIN du
-# téléchargement (pas après son début : une longue vidéo peut mettre plus de
-# 5 min à se télécharger). Un job qui ne finit jamais (bloqué) est abandonné
+# téléchargement (pas après son début : une longue vidéo peut mettre plus de 5 min à se télécharger).
+# Un job qui ne finit jamais (bloqué) est abandonné
 # après 4h — bien au-delà du watchdog (15 min), qui lui gère un yt-dlp figé.
 FINISHED_JOB_TTL_SECONDS = 5 * 60
 STUCK_JOB_MAX_SECONDS = 4 * 60 * 60
