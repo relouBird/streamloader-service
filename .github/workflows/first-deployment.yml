@@ -67,7 +67,7 @@ jobs:
             # Keep the production .env and initialize Git beside it.
             # Dotfiles are server-side configuration (for example .env* and
             # .htaccess) and must not block or be replaced by deployment.
-            EXTRA_FILE="$(find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name '.*' ! -name 'ffmpeg' ! -name 'ffprobe' ! -name "$ENTRYPOINT" -print -quit)"
+            EXTRA_FILE="$(find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name '.*' ! -name 'ffmpeg' ! -name "$ENTRYPOINT" ! -name '__pycache__' -print -quit)"
             if [ -n "$EXTRA_FILE" ]; then
               echo "ERROR: Existing directory contains unexpected files: $EXTRA_FILE"
               exit 1
