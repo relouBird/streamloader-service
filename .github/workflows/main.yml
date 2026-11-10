@@ -1,0 +1,113 @@
+name: Deploy production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: planethoster-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy changed revision
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy through SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_SSH_PORT || 5022 }}
+          script_stop: true
+          script: |
+            set -e
+
+            APP_ROOT="api"
+            APP_DIR="$HOME/$APP_ROOT"
+            FFMPEG_DIR="$APP_DIR/ffmpeg"
+            FFMPEG_BIN="$FFMPEG_DIR/ffmpeg"
+            FFPROBE_BIN="$FFMPEG_DIR/ffprobe"
+            REPOSITORY="https://github.com/relouBird/streamloader-service.git"
+            BRANCH="main"
+            PY_ENV_ACTIVATE="$HOME/virtualenv/api/3.14/bin/activate"
+            ENV_FILE="$APP_DIR/.env"
+            ENTRYPOINT="passenger_wsgi.py"
+            REQUIREMENTS="requirements.txt"
+            DEPLOY_LOCK="$HOME/.streamloader-service-deploy.lock"
+
+            if [ ! -f "$PY_ENV_ACTIVATE" ]; then
+              echo "ERROR: Python environment not found: $PY_ENV_ACTIVATE"
+              exit 1
+            fi
+
+            # CloudLinux's activation script reads optional unset variables.
+            # Load it before enabling Bash nounset for the deployment itself.
+            source "$PY_ENV_ACTIVATE"
+            set -u
+
+            if [ ! -d "$APP_DIR/.git" ]; then
+              echo "ERROR: Production is not initialized. Run the first-deployment workflow first."
+              exit 1
+            fi
+
+            if [ ! -f "$ENV_FILE" ]; then
+              echo "ERROR: Production .env is missing: $ENV_FILE"
+              exit 1
+            fi
+            
+            if [ ! -x "$FFMPEG_BIN" ] || [ ! -x "$FFPROBE_BIN" ]; then
+              echo "ERROR: ffmpeg/ffprobe missing or not executable in $FFMPEG_DIR"
+              echo "The workflow never uploads or generates these binaries."
+              exit 1
+            fi
+
+            if ! ( set -o noclobber; mkdir "$DEPLOY_LOCK" ) 2>/dev/null; then
+              echo "ERROR: Another deployment is already running."
+              exit 1
+            fi
+            trap 'rmdir "$DEPLOY_LOCK"' EXIT
+
+            cd "$APP_DIR"
+            CURRENT_SHA="$(git rev-parse HEAD)"
+            git fetch --prune origin "$BRANCH"
+            TARGET_SHA="$(git rev-parse "origin/$BRANCH")"
+
+            if [ "$CURRENT_SHA" = "$TARGET_SHA" ]; then
+              echo "Already deployed: $TARGET_SHA"
+              exit 0
+            fi
+
+            echo "Changes between $CURRENT_SHA and $TARGET_SHA:"
+            git diff --name-status "$CURRENT_SHA" "$TARGET_SHA"
+
+            # .env is ignored and is deliberately never reset, copied, or generated.
+            git reset --hard "$TARGET_SHA"
+            # # Keep server-side dotfiles and the ffmpeg binaries. (.env*, .htaccess, ffmpeg, etc.).
+            git clean -fd -e '.*' -e 'ffmpeg' -e 'ffprobe'
+
+            test -f "$APP_DIR/$REQUIREMENTS"
+            test -f "$APP_DIR/$ENTRYPOINT"
+
+            python -m pip install --upgrade pip
+            python -m pip install --no-cache-dir -r "$REQUIREMENTS"
+
+            # Fail early on syntax errors (no build step in Python).
+            python -m compileall -q .
+
+            # Documentation is not part of the runtime and must not be served
+            # from the production application directory.
+            find "$APP_DIR" -maxdepth 1 -type f -iname '*.md' -delete
+
+            # The application creates missing tables and applies additive migrations.
+            # No DROP, TRUNCATE, or database reset is performed by this workflow.
+            /usr/sbin/cloudlinux-selector restart \
+              --json \
+              --interpreter=python \
+              --app-root="$APP_ROOT"
+
+            echo "Deployment successful: $TARGET_SHA"
