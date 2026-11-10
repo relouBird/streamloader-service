@@ -29,15 +29,16 @@ jobs:
 
             APP_ROOT="api"
             APP_DIR="$HOME/$APP_ROOT"
+            ENTRYPOINT="passenger_wsgi.py"
+            REQUIREMENTS="requirements.txt"
             FFMPEG_DIR="$APP_DIR/ffmpeg"
             FFMPEG_BIN="$FFMPEG_DIR/ffmpeg"
             FFPROBE_BIN="$FFMPEG_DIR/ffprobe"
+            ENTRYPOINT_FILE="$APP_DIR/$ENTRYPOINT"
             REPOSITORY="https://github.com/relouBird/streamloader-service.git"
             BRANCH="main"
             PY_ENV_ACTIVATE="$HOME/virtualenv/api/3.14/bin/activate"
             ENV_FILE="$APP_DIR/.env"
-            ENTRYPOINT="passenger_wsgi.py"
-            REQUIREMENTS="requirements.txt"
             DEPLOY_LOCK="$HOME/.streamloader-service-deploy.lock"
 
             if [ ! -f "$PY_ENV_ACTIVATE" ]; then
@@ -66,6 +67,12 @@ jobs:
               exit 1
             fi
 
+            if [ ! -f "$ENTRYPOINT_FILE" ]; then
+              echo "ERROR: $ENTRYPOINT is missing in $APP_DIR"
+              echo "The workflow never uploads or generates this file."
+              exit 1
+            fi
+
             if ! ( set -o noclobber; mkdir "$DEPLOY_LOCK" ) 2>/dev/null; then
               echo "ERROR: Another deployment is already running."
               exit 1
@@ -87,11 +94,10 @@ jobs:
 
             # .env is ignored and is deliberately never reset, copied, or generated.
             git reset --hard "$TARGET_SHA"
-            # # Keep server-side dotfiles and the ffmpeg binaries. (.env*, .htaccess, ffmpeg, etc.).
-            git clean -fd -e '.*' -e 'ffmpeg' -e 'ffprobe'
+            # # Keep server-side dotfiles and the ffmpeg binaries and the Passenger entrypoint.. (.env*, .htaccess, ffmpeg, etc.).
+            git clean -fd -e '.*' -e 'ffmpeg' -e 'ffprobe' -e "$ENTRYPOINT"
 
             test -f "$APP_DIR/$REQUIREMENTS"
-            test -f "$APP_DIR/$ENTRYPOINT"
 
             python -m pip install --upgrade pip
             python -m pip install --no-cache-dir -r "$REQUIREMENTS"

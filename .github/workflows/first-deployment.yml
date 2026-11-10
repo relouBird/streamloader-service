@@ -26,15 +26,16 @@ jobs:
 
             APP_ROOT="api"                       # relatif au HOME (format attendu par cloudlinux-selector)
             APP_DIR="$HOME/$APP_ROOT"
+            ENTRYPOINT="passenger_wsgi.py"       # fichier de démarrage configuré dans le Python Selector
+            REQUIREMENTS="requirements.txt"
             FFMPEG_DIR="$APP_DIR/ffmpeg"
             FFMPEG_BIN="$FFMPEG_DIR/ffmpeg"
             FFPROBE_BIN="$FFMPEG_DIR/ffprobe"
+            ENTRYPOINT_FILE="$APP_DIR/$ENTRYPOINT"
             REPOSITORY="https://github.com/relouBird/streamloader-service.git"
             BRANCH="main"
             PY_ENV_ACTIVATE="$HOME/virtualenv/api/3.14/bin/activate"
             ENV_FILE="$APP_DIR/.env"
-            ENTRYPOINT="passenger_wsgi.py"       # fichier de démarrage configuré dans le Python Selector
-            REQUIREMENTS="requirements.txt"
 
             if [ ! -f "$PY_ENV_ACTIVATE" ]; then
               echo "ERROR: Python environment not found: $PY_ENV_ACTIVATE"
@@ -46,8 +47,8 @@ jobs:
             source "$PY_ENV_ACTIVATE"
             set -u
 
-            if [ ! -d "$APP_DIR" ] || [ ! -f "$ENV_FILE" ]; then
-              echo "ERROR: Create $ENV_FILE on the server before running this workflow."
+            if [ ! -d "$APP_DIR" ] || [ ! -f "$ENV_FILE" ] || [ ! -f "$ENTRYPOINT_FILE" ]; then
+              echo "ERROR: Create $ENV_FILE and $ENTRYPOINT_FILE on the server before running this workflow."
               echo "The workflow never copies local .env files or GitHub secrets into the application directory."
               exit 1
             fi
@@ -66,7 +67,7 @@ jobs:
             # Keep the production .env and initialize Git beside it.
             # Dotfiles are server-side configuration (for example .env* and
             # .htaccess) and must not block or be replaced by deployment.
-            EXTRA_FILE="$(find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name '.*' ! -name 'ffmpeg' ! -name 'ffprobe' -print -quit)"
+            EXTRA_FILE="$(find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name '.*' ! -name 'ffmpeg' ! -name 'ffprobe' ! -name "$ENTRYPOINT" -print -quit)"
             if [ -n "$EXTRA_FILE" ]; then
               echo "ERROR: Existing directory contains unexpected files: $EXTRA_FILE"
               exit 1
@@ -79,7 +80,6 @@ jobs:
             git checkout -B "$BRANCH" "origin/$BRANCH"
 
             test -f "$APP_DIR/$REQUIREMENTS"
-            test -f "$APP_DIR/$ENTRYPOINT"
 
             python --version
             python -m pip install --upgrade pip

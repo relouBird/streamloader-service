@@ -8,6 +8,7 @@ ffmpeg/
 ffmpeg-linux/
 tmp/
 .vscode/
+passenger_wsgi.py
 
 # C extensions
 *.so
